@@ -36,23 +36,86 @@ CREATE TABLE IF NOT EXISTS files (
 
 conn.commit()
 
-# ================= SPLASH =================
+# ================= SPLASH (ONBOARDING) =================
 @app.route("/")
 def splash():
     return """
     <html>
-    <body style="margin:0;background:linear-gradient(45deg,#833ab4,#fd1d1d,#fcb045);
-    height:100vh;display:flex;align-items:center;justify-content:center;font-family:Arial;">
-        <div style="text-align:center;color:white;">
-            <h1 style="font-size:50px;">Snap2See</h1>
-            <p>Smart QR SaaS Platform</p>
-            <a href="/login" style="padding:10px 20px;background:white;color:black;border-radius:10px;text-decoration:none;">Enter</a>
+    <head>
+    <style>
+        body{
+            margin:0;
+            font-family:Arial;
+            background:#0f0f10;
+            color:white;
+        }
+        .container{
+            height:100vh;
+            overflow-y:scroll;
+            scroll-snap-type:y mandatory;
+        }
+        .page{
+            height:100vh;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            flex-direction:column;
+            scroll-snap-align:start;
+            padding:40px;
+            text-align:center;
+        }
+        .title{font-size:40px;margin-bottom:10px;}
+        .btn{
+            padding:12px 20px;
+            background:white;
+            color:black;
+            border-radius:10px;
+            text-decoration:none;
+            margin-top:20px;
+        }
+        .card{
+            background:#1c1c1e;
+            padding:20px;
+            border-radius:15px;
+            width:300px;
+        }
+        input{
+            width:90%;
+            padding:10px;
+            margin:8px;
+            border-radius:10px;
+            border:none;
+            background:#2c2c2e;
+            color:white;
+        }
+    </style>
+    </head>
+
+    <body>
+    <div class="container">
+
+        <div class="page">
+            <div class="title">Snap2See</div>
+            <div>QR platform for files and tracking</div>
+            <a class="btn" href="/login">Start</a>
         </div>
+
+        <div class="page">
+            <h2>What you can do</h2>
+            <p>Create QR codes that open files instantly</p>
+        </div>
+
+        <div class="page">
+            <h2>Manage everything</h2>
+            <p>Track scans and update QR content anytime</p>
+        </div>
+
+    </div>
     </body>
     </html>
     """
 
-# ================= LOGIN =================
+# ================= LOGIN / CREATE =================
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -63,7 +126,7 @@ def login():
         user = c.fetchone()
 
         if not user:
-            c.execute("INSERT INTO users (username, password) VALUES (?,?)", (u, p))
+            c.execute("INSERT INTO users (username,password) VALUES (?,?)", (u, p))
             conn.commit()
             user_id = c.lastrowid
         else:
@@ -74,13 +137,19 @@ def login():
 
     return """
     <html>
-    <body style="background:#111;color:white;font-family:Arial;text-align:center;">
-        <h2>Login</h2>
+    <body style="margin:0;background:#0f0f10;color:white;font-family:Arial;
+    display:flex;align-items:center;justify-content:center;height:100vh;">
+
+    <div style="background:#1c1c1e;padding:30px;border-radius:15px;width:320px;">
+        <h2>Create account</h2>
+
         <form method="post">
-            <input name="username" placeholder="username"><br><br>
-            <input name="password" type="password" placeholder="password"><br><br>
-            <button>Login</button>
+            <input name="username" placeholder="Username"><br>
+            <input name="password" type="password" placeholder="Password"><br>
+            <button style="width:100%;padding:10px;margin-top:10px;">Continue</button>
         </form>
+    </div>
+
     </body>
     </html>
     """
@@ -91,38 +160,28 @@ def dashboard():
     if "user_id" not in session:
         return redirect("/login")
 
-    c.execute("SELECT is_pro FROM users WHERE id=?", (session["user_id"],))
-    pro = c.fetchone()[0]
-
-    return f"""
+    return """
     <html>
-    <body style="font-family:Arial;background:#0f0f10;color:white;">
-        <div style="padding:20px;background:#1c1c1e;">
-            <h2>Snap2See Dashboard</h2>
-            <a href="/upgrade" style="color:#ffcc00;">{"PRO USER" if pro else "Upgrade Pro ($10 fake)"}</a>
-        </div>
+    <body style="margin:0;background:#0f0f10;color:white;font-family:Arial;">
 
-        <div style="padding:20px;">
-            <form action="/upload" method="post" enctype="multipart/form-data">
-                <input type="file" name="file">
-                <button>Create QR</button>
-            </form>
+    <div style="padding:20px;background:#1c1c1e;">
+        <h2>Dashboard</h2>
+        <a href="/analytics" style="color:#4da6ff;">Analytics</a> |
+        <a href="/manage" style="color:#4da6ff;">Manage QR</a>
+    </div>
 
-            <br>
-            <a href="/manage">Manage QR Codes</a>
-        </div>
+    <div style="padding:20px;">
+        <form action="/upload" method="post" enctype="multipart/form-data">
+            <input type="file" name="file">
+            <button>Create QR</button>
+        </form>
+    </div>
+
     </body>
     </html>
     """
 
-# ================= UPGRADE =================
-@app.route("/upgrade")
-def upgrade():
-    c.execute("UPDATE users SET is_pro=1 WHERE id=?", (session["user_id"],))
-    conn.commit()
-    return redirect("/dashboard")
-
-# ================= UPLOAD + QR =================
+# ================= UPLOAD =================
 @app.route("/upload", methods=["POST"])
 def upload():
     file = request.files["file"]
@@ -134,7 +193,7 @@ def upload():
     file.save(path)
 
     c.execute("""
-        INSERT INTO files (id, user_id, filename, created)
+        INSERT INTO files (id,user_id,filename,created)
         VALUES (?,?,?,?)
     """, (file_id, session["user_id"], filename, datetime.now()))
 
@@ -144,22 +203,11 @@ def upload():
     link = f"{base}/view/{file_id}"
 
     img = qrcode.make(link)
-    qr_path = os.path.join(QRS, file_id + ".png")
-    img.save(qr_path)
+    img.save(os.path.join(QRS, file_id + ".png"))
 
-    return f"""
-    <h2>QR Created</h2>
-    <img src="/qr/{file_id}" width="200">
-    <p>{link}</p>
-    <a href="/dashboard">Back</a>
-    """
+    return redirect("/manage")
 
-# ================= QR IMAGE =================
-@app.route("/qr/<id>")
-def qr(id):
-    return send_file(os.path.join(QRS, id + ".png"))
-
-# ================= VIEW FILE =================
+# ================= VIEW =================
 @app.route("/view/<id>")
 def view(id):
     c.execute("SELECT filename FROM files WHERE id=?", (id,))
@@ -173,53 +221,16 @@ def view(id):
     c.execute("UPDATE files SET scans = scans + 1 WHERE id=?", (id,))
     conn.commit()
 
-    file_path = os.path.join(UPLOADS, filename)
+    return send_file(os.path.join(UPLOADS, filename))
 
-    return send_file(file_path)
-
-# ================= MANAGE QR =================
+# ================= MANAGE =================
 @app.route("/manage")
 def manage():
-    c.execute("SELECT id, filename, scans FROM files WHERE user_id=?", (session["user_id"],))
+    c.execute("SELECT id, scans FROM files WHERE user_id=?", (session["user_id"],))
     rows = c.fetchall()
 
-    html = "<h2>My QR Codes</h2>"
+    html = "<h2>Manage QR Codes</h2>"
 
     for r in rows:
         html += f"""
-        <div style="padding:10px;border:1px solid #333;margin:10px;">
-            <p>ID: {r[0]}</p>
-            <p>Scans: {r[2]}</p>
-            <a href="/view/{r[0]}">Open</a> |
-            <a href="/edit/{r[0]}">Change File</a>
-        </div>
-        """
-
-    return html
-
-# ================= EDIT QR (DYNAMIC) =================
-@app.route("/edit/<id>", methods=["GET", "POST"])
-def edit(id):
-    if request.method == "POST":
-        file = request.files["file"]
-
-        c.execute("SELECT filename FROM files WHERE id=?", (id,))
-        old = c.fetchone()[0]
-
-        path = os.path.join(UPLOADS, old)
-        file.save(path)
-
-        return redirect("/manage")
-
-    return """
-    <h2>Replace File for QR</h2>
-    <form method="post" enctype="multipart/form-data">
-        <input type="file" name="file">
-        <button>Update</button>
-    </form>
-    """
-
-# ================= RUN =================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="https://qr-0i2j.onrender.com", port=port)
+        <div style="padding:10
