@@ -1,9 +1,8 @@
 from flask import Flask, request, redirect, session, send_file
 import sqlite3, os, uuid, qrcode
-from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = "snap2see-key"
+app.secret_key = "snap2see-ultra-ui"
 
 UPLOADS = "uploads"
 QRS = "qrs"
@@ -17,49 +16,91 @@ c = conn.cursor()
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT,
-    password TEXT,
-    is_pro INTEGER DEFAULT 0
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+username TEXT,
+password TEXT,
+is_pro INTEGER DEFAULT 0
 )
 """)
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS files (
-    id TEXT PRIMARY KEY,
-    user_id INTEGER,
-    filename TEXT,
-    scans INTEGER DEFAULT 0,
-    created TEXT
+id TEXT PRIMARY KEY,
+user_id INTEGER,
+filename TEXT,
+scans INTEGER DEFAULT 0
 )
 """)
 
 conn.commit()
 
-# ================= UI STYLE =================
+# ================= APP STYLE =================
 STYLE = """
 <style>
 body{
     margin:0;
     font-family:Arial;
-    background:#0b0f19;
+    background: radial-gradient(circle at top, #1a1f2e, #05070d);
     color:white;
 }
 
-.screen{
-    height:100vh;
+/* smooth animations */
+.fade{
+    animation: fade 0.6s ease;
+}
+
+@keyframes fade{
+    from{opacity:0; transform:translateY(10px);}
+    to{opacity:1; transform:translateY(0);}
+}
+
+/* glass UI */
+.card{
+    background:rgba(255,255,255,0.06);
+    backdrop-filter: blur(18px);
+    padding:25px;
+    border-radius:18px;
+    width:340px;
+    box-shadow:0 10px 40px rgba(0,0,0,0.5);
+    text-align:center;
+}
+
+.center{
     display:flex;
+    height:100vh;
     align-items:center;
     justify-content:center;
     flex-direction:column;
 }
 
-.card{
-    background:#141b2d;
-    padding:20px;
-    border-radius:16px;
-    width:320px;
+h1,h2{
+    margin:5px;
 }
+
+p{
+    opacity:0.7;
+}
+
+/* buttons */
+.btn{
+    width:100%;
+    padding:12px;
+    border:none;
+    border-radius:12px;
+    margin-top:10px;
+    cursor:pointer;
+    transition:0.2s;
+    font-size:14px;
+}
+
+.btn:hover{
+    transform:scale(1.03);
+}
+
+.primary{background:#4f7cff;color:white;}
+.green{background:#00c853;color:black;}
+.gray{background:#2a2f3a;color:white;}
+.purple{background:#7c4dff;color:white;}
 
 input{
     width:100%;
@@ -67,101 +108,120 @@ input{
     margin:6px 0;
     border-radius:10px;
     border:none;
-    background:#1f2a44;
+    background:#1c2230;
     color:white;
 }
 
-button{
-    width:100%;
-    padding:10px;
-    border:none;
-    border-radius:10px;
-    background:#4f7cff;
-    color:white;
-    cursor:pointer;
-}
-
+/* top bar */
 .nav{
     padding:15px;
-    background:#10182a;
+    background:rgba(0,0,0,0.4);
     display:flex;
     justify-content:space-between;
+    backdrop-filter: blur(10px);
 }
 a{color:#7aa2ff;text-decoration:none;}
 </style>
 """
 
-# ================= SPLASH =================
+# ================= SPLASH (APP STORE STYLE) =================
 @app.route("/")
 def splash():
     return STYLE + """
-    <div class="screen">
-        <h1>Snap2See</h1>
-        <p>Upload → QR → Share instantly</p>
-        <a href="/login">Start</a>
+    <div class="center fade">
+        <div class="card">
+            <h1>Snap2See</h1>
+            <p>Upload files. Generate QR codes. Track scans instantly.</p>
+
+            <a href="/create">
+                <button class="btn primary">Get Started</button>
+            </a>
+
+            <button class="btn gray">How it works</button>
+            <button class="btn purple">Why Snap2See</button>
+        </div>
     </div>
     """
 
-# ================= LOGIN =================
-@app.route("/login", methods=["GET","POST"])
-def login():
+# ================= CREATE ACCOUNT =================
+@app.route("/create", methods=["GET","POST"])
+def create():
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
 
-        c.execute("SELECT * FROM users WHERE username=? AND password=?", (u,p))
-        user = c.fetchone()
+        c.execute("INSERT INTO users (username,password) VALUES (?,?)", (u,p))
+        conn.commit()
 
-        if not user:
-            c.execute("INSERT INTO users (username,password) VALUES (?,?)", (u,p))
-            conn.commit()
-            user_id = c.lastrowid
-        else:
-            user_id = user[0]
-
-        session["user_id"] = user_id
-        return redirect("/dashboard")
+        session["user_id"] = c.lastrowid
+        return redirect("/payment")
 
     return STYLE + """
-    <div class="screen">
+    <div class="center fade">
         <div class="card">
-            <h2>Login</h2>
+            <h2>Create Account</h2>
+
             <form method="post">
-                <input name="username" placeholder="username">
-                <input name="password" type="password" placeholder="password">
-                <button>Continue</button>
+                <input name="username" placeholder="Username">
+                <input name="password" type="password" placeholder="Password">
+
+                <button class="btn green">Continue</button>
             </form>
         </div>
     </div>
     """
+
+# ================= PAYMENT UI =================
+@app.route("/payment")
+def payment():
+    return STYLE + """
+    <div class="center fade">
+        <div class="card">
+            <h2>Upgrade Plan</h2>
+            <p>$10 Pro Plan (Fake UI)</p>
+
+            <a href="/activate">
+                <button class="btn primary">Continue to Pro</button>
+            </a>
+
+            <a href="/dashboard">
+                <button class="btn gray">Skip</button>
+            </a>
+        </div>
+    </div>
+    """
+
+@app.route("/activate")
+def activate():
+    c.execute("UPDATE users SET is_pro=1 WHERE id=?", (session["user_id"],))
+    conn.commit()
+    return redirect("/dashboard")
 
 # ================= DASHBOARD =================
 @app.route("/dashboard")
 def dashboard():
-    if "user_id" not in session:
-        return redirect("/login")
-
     return STYLE + """
     <div class="nav">
         <div>Snap2See</div>
         <div>
-            <a href="/analytics">Analytics</a> |
-            <a href="/manage">Manage</a>
+            <a href="/manage">Manage</a> |
+            <a href="/analytics">Analytics</a>
         </div>
     </div>
 
-    <div class="screen">
+    <div class="center fade">
         <div class="card">
-            <h3>Create QR</h3>
+            <h2>Create QR</h2>
+
             <form action="/upload" method="post" enctype="multipart/form-data">
                 <input type="file" name="file">
-                <button>Generate</button>
+                <button class="btn green">Generate QR</button>
             </form>
         </div>
     </div>
     """
 
-# ================= UPLOAD + SHOW QR =================
+# ================= UPLOAD + QR PREVIEW =================
 @app.route("/upload", methods=["POST"])
 def upload():
     file = request.files["file"]
@@ -172,49 +232,47 @@ def upload():
     path = os.path.join(UPLOADS, filename)
     file.save(path)
 
-    c.execute("""
-        INSERT INTO files (id,user_id,filename,created)
-        VALUES (?,?,?,?)
-    """, (file_id, session["user_id"], filename, datetime.now()))
+    c.execute("INSERT INTO files (id,user_id,filename) VALUES (?,?,?)",
+              (file_id, session["user_id"], filename))
     conn.commit()
 
-    base = request.host_url.strip("/")
-    link = f"{base}/view/{file_id}"
+    link = request.host_url.strip("/") + "/view/" + file_id
 
-    qr_img = qrcode.make(link)
-    qr_path = os.path.join(QRS, file_id + ".png")
-    qr_img.save(qr_path)
+    qr = qrcode.make(link)
+    qr.save(os.path.join(QRS, file_id + ".png"))
 
-    # IMPORTANT: show QR immediately
+    # IMPORTANT: SHOW QR IMMEDIATELY
     return STYLE + f"""
-    <div class="screen">
+    <div class="center fade">
         <div class="card">
-            <h2>QR Created</h2>
-            <img src="/qr/{file_id}" width="200">
-            <p>Scan to open file</p>
-            <a href="/manage">Go to Manager</a>
+            <h2>QR Generated</h2>
+
+            <img src="/qr/{file_id}" width="200" style="margin:10px;border-radius:12px;">
+
+            <p>Scan to open file instantly</p>
+
+            <a href="/manage">
+                <button class="btn primary">Go to Dashboard</button>
+            </a>
         </div>
     </div>
     """
-
-# ================= QR IMAGE =================
-@app.route("/qr/<id>")
-def qr(id):
-    return send_file(os.path.join(QRS, id + ".png"))
 
 # ================= VIEW FILE =================
 @app.route("/view/<id>")
 def view(id):
     c.execute("SELECT filename FROM files WHERE id=?", (id,))
-    data = c.fetchone()
-
-    if not data:
-        return "Not found"
+    file = c.fetchone()[0]
 
     c.execute("UPDATE files SET scans = scans + 1 WHERE id=?", (id,))
     conn.commit()
 
-    return send_file(os.path.join(UPLOADS, data[0]))
+    return send_file(os.path.join(UPLOADS, file))
+
+# ================= QR IMAGE =================
+@app.route("/qr/<id>")
+def qr(id):
+    return send_file(os.path.join(QRS, id + ".png"))
 
 # ================= MANAGE =================
 @app.route("/manage")
@@ -222,8 +280,14 @@ def manage():
     c.execute("SELECT id, scans FROM files WHERE user_id=?", (session["user_id"],))
     rows = c.fetchall()
 
-    html = STYLE + "<div class='nav'><div>Manager</div><a href='/dashboard'>Back</a></div>"
-    html += "<div class='screen'>"
+    html = STYLE + """
+    <div class="nav">
+        <div>Manage QR</div>
+        <a href="/dashboard">Back</a>
+    </div>
+
+    <div class="center fade">
+    """
 
     for r in rows:
         html += f"""
@@ -245,19 +309,16 @@ def analytics():
 
     total = sum(r[0] for r in rows)
 
-    html = STYLE + "<div class='nav'><div>Analytics</div><a href='/dashboard'>Back</a></div>"
-    html += f"""
-    <div class="screen">
+    return STYLE + f"""
+    <div class="center fade">
         <div class="card">
-            <h2>Total Scans</h2>
+            <h2>Analytics</h2>
             <h1>{total}</h1>
+            <p>Total QR scans</p>
         </div>
     </div>
     """
 
-    return html
-
 # ================= RUN =================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
