@@ -3,7 +3,7 @@ import sqlite3, os, uuid, qrcode
 from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = "snap2see-secure-key"
+app.secret_key = "snap2see-key"
 
 UPLOADS = "uploads"
 QRS = "qrs"
@@ -42,33 +42,32 @@ STYLE = """
 body{
     margin:0;
     font-family:Arial;
-    background:#0b0f17;
+    background:#0b0f19;
     color:white;
 }
 
-.center{
-    display:flex;
-    justify-content:center;
-    align-items:center;
+.screen{
     height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
     flex-direction:column;
 }
 
 .card{
-    background:rgba(255,255,255,0.06);
+    background:#141b2d;
     padding:20px;
     border-radius:16px;
-    backdrop-filter: blur(10px);
     width:320px;
 }
 
 input{
     width:100%;
     padding:10px;
-    margin:8px 0;
+    margin:6px 0;
     border-radius:10px;
     border:none;
-    background:#1c2230;
+    background:#1f2a44;
     color:white;
 }
 
@@ -84,11 +83,10 @@ button{
 
 .nav{
     padding:15px;
-    background:#121a2a;
+    background:#10182a;
     display:flex;
     justify-content:space-between;
 }
-
 a{color:#7aa2ff;text-decoration:none;}
 </style>
 """
@@ -97,9 +95,9 @@ a{color:#7aa2ff;text-decoration:none;}
 @app.route("/")
 def splash():
     return STYLE + """
-    <div class="center">
+    <div class="screen">
         <h1>Snap2See</h1>
-        <p>QR SaaS Platform</p>
+        <p>Upload → QR → Share instantly</p>
         <a href="/login">Start</a>
     </div>
     """
@@ -125,7 +123,7 @@ def login():
         return redirect("/dashboard")
 
     return STYLE + """
-    <div class="center">
+    <div class="screen">
         <div class="card">
             <h2>Login</h2>
             <form method="post">
@@ -148,22 +146,22 @@ def dashboard():
         <div>Snap2See</div>
         <div>
             <a href="/analytics">Analytics</a> |
-            <a href="/manage">QR Manager</a>
+            <a href="/manage">Manage</a>
         </div>
     </div>
 
-    <div class="center">
+    <div class="screen">
         <div class="card">
             <h3>Create QR</h3>
             <form action="/upload" method="post" enctype="multipart/form-data">
                 <input type="file" name="file">
-                <button>Create</button>
+                <button>Generate</button>
             </form>
         </div>
     </div>
     """
 
-# ================= UPLOAD =================
+# ================= UPLOAD + SHOW QR =================
 @app.route("/upload", methods=["POST"])
 def upload():
     file = request.files["file"]
@@ -178,18 +176,33 @@ def upload():
         INSERT INTO files (id,user_id,filename,created)
         VALUES (?,?,?,?)
     """, (file_id, session["user_id"], filename, datetime.now()))
-
     conn.commit()
 
     base = request.host_url.strip("/")
     link = f"{base}/view/{file_id}"
 
-    img = qrcode.make(link)
-    img.save(os.path.join(QRS, file_id + ".png"))
+    qr_img = qrcode.make(link)
+    qr_path = os.path.join(QRS, file_id + ".png")
+    qr_img.save(qr_path)
 
-    return redirect("/manage")
+    # IMPORTANT: show QR immediately
+    return STYLE + f"""
+    <div class="screen">
+        <div class="card">
+            <h2>QR Created</h2>
+            <img src="/qr/{file_id}" width="200">
+            <p>Scan to open file</p>
+            <a href="/manage">Go to Manager</a>
+        </div>
+    </div>
+    """
 
-# ================= VIEW =================
+# ================= QR IMAGE =================
+@app.route("/qr/<id>")
+def qr(id):
+    return send_file(os.path.join(QRS, id + ".png"))
+
+# ================= VIEW FILE =================
 @app.route("/view/<id>")
 def view(id):
     c.execute("SELECT filename FROM files WHERE id=?", (id,))
@@ -203,74 +216,45 @@ def view(id):
 
     return send_file(os.path.join(UPLOADS, data[0]))
 
-# ================= MANAGE QR =================
+# ================= MANAGE =================
 @app.route("/manage")
 def manage():
     c.execute("SELECT id, scans FROM files WHERE user_id=?", (session["user_id"],))
     rows = c.fetchall()
 
-    html = STYLE + "<div class='nav'><div>QR Manager</div><a href='/dashboard'>Back</a></div>"
-    html += "<div class='center'>"
-
-    for r in rows:
-        html += f"""
-        <div class="card">
-            <p><b>ID:</b> {r[0]}</p>
-            <p><b>Scans:</b> {r[1]}</p>
-            <a href="/view/{r[0]}">Open</a> |
-            <a href="/edit/{r[0]}">Replace File</a>
-        </div>
-        """
-
-    html += "</div>"
-    return html
-
-# ================= EDIT QR =================
-@app.route("/edit/<id>", methods=["GET","POST"])
-def edit(id):
-    if request.method == "POST":
-        file = request.files["file"]
-
-        c.execute("SELECT filename FROM files WHERE id=?", (id,))
-        old = c.fetchone()[0]
-
-        path = os.path.join(UPLOADS, old)
-        file.save(path)
-
-        return redirect("/manage")
-
-    return STYLE + """
-    <div class="center">
-        <div class="card">
-            <h3>Replace File</h3>
-            <form method="post" enctype="multipart/form-data">
-                <input type="file" name="file">
-                <button>Update</button>
-            </form>
-        </div>
-    </div>
-    """
-
-# ================= ANALYTICS =================
-@app.route("/analytics")
-def analytics():
-    c.execute("SELECT id, scans FROM files WHERE user_id=?", (session["user_id"],))
-    rows = c.fetchall()
-
-    total = sum(r[1] for r in rows)
-
-    html = STYLE + "<div class='nav'><div>Analytics</div><a href='/dashboard'>Back</a></div>"
-    html += f"<div class='center'><div class='card'><h2>Total Scans</h2><h1>{total}</h1></div>"
+    html = STYLE + "<div class='nav'><div>Manager</div><a href='/dashboard'>Back</a></div>"
+    html += "<div class='screen'>"
 
     for r in rows:
         html += f"""
         <div class="card">
             <p>{r[0]}</p>
             <p>Scans: {r[1]}</p>
+            <a href="/view/{r[0]}">Open</a>
         </div>
         """
 
     html += "</div>"
+    return html
+
+# ================= ANALYTICS =================
+@app.route("/analytics")
+def analytics():
+    c.execute("SELECT scans FROM files WHERE user_id=?", (session["user_id"],))
+    rows = c.fetchall()
+
+    total = sum(r[0] for r in rows)
+
+    html = STYLE + "<div class='nav'><div>Analytics</div><a href='/dashboard'>Back</a></div>"
+    html += f"""
+    <div class="screen">
+        <div class="card">
+            <h2>Total Scans</h2>
+            <h1>{total}</h1>
+        </div>
+    </div>
+    """
+
     return html
 
 # ================= RUN =================
