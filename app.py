@@ -751,9 +751,36 @@ def upload():
     if "user_id" not in session:
         return redirect("/login")
 
+    # 🔒 REQUIRE PRO
+    c.execute("SELECT is_pro FROM users WHERE id=?", (session["user_id"],))
+    user = c.fetchone()
+    if not user or user[0] != 1:
+        return redirect("/upgrade")  # force payment
+
     file = request.files.get("file")
     if not file or not file.filename:
         return redirect("/dashboard")
+
+    file_id   = str(uuid.uuid4())
+    safe      = file.filename.replace("/", "_").replace("..", "_")
+    filename  = file_id + "_" + safe
+    path      = os.path.join(UPLOADS, filename)
+    file.save(path)
+
+    watermarked = apply_watermark(path)
+
+    c.execute("INSERT INTO files (id, user_id, filename, created) VALUES (?,?,?,?)",
+              (file_id, session["user_id"], filename,
+               datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+
+    base    = request.host_url.rstrip("/")
+    link    = f"{base}/view/{file_id}"
+    qr_img  = qrcode.make(link)
+    qr_path = os.path.join(QRS, file_id + ".png")
+    qr_img.save(qr_path)
+
+    return redirect(f"/qrview/{file_id}")  # 👈 NEW redirect
 
     file_id   = str(uuid.uuid4())
     safe      = file.filename.replace("/", "_").replace("..", "_")
@@ -828,6 +855,41 @@ def upload():
 </div>
 """
     return page("QR Created", body)
+
+@app.route("/qrview/<id>")
+def qrview(id):
+    if "user_id" not in session:
+        return redirect("/login")
+
+    c.execute("SELECT filename, user_id FROM files WHERE id=?", (id,))
+    row = c.fetchone()
+
+    if not row or row[1] != session["user_id"]:
+        return redirect("/manage")
+
+    base = request.host_url.rstrip("/")
+    link = f"{base}/view/{id}"
+
+    body = f"""
+    <div style="max-width:480px;margin:0 auto;padding:60px 24px;text-align:center;">
+        <h1 style="font-size:26px;font-weight:700;margin-bottom:20px;">Your QR Code</h1>
+
+        <div class="glass" style="padding:30px;border-radius:20px;margin-bottom:20px;">
+            <img src="/qr/{id}" width="220" style="background:#fff;border-radius:10px;">
+        </div>
+
+        <div class="glass" style="padding:14px;border-radius:12px;margin-bottom:20px;">
+            <div style="font-size:12px;color:gray;">Link</div>
+            <div style="font-size:13px;color:#2997ff;word-break:break-all;">{link}</div>
+        </div>
+
+        <div style="display:flex;gap:10px;justify-content:center;">
+            <a href="/dashboard" class="btn btnp">Dashboard</a>
+            <a href="/manage" class="btn btng">All QRs</a>
+        </div>
+    </div>
+    """
+    return page("View QR", body)
 
 
 # ── QR IMAGE ──────────────────────────────────────────────────────────────────
@@ -906,7 +968,7 @@ def manage():
                         text-transform:uppercase;letter-spacing:.04em;">scans</div>
                 </div>
                 <div style="display:flex;gap:8px;flex-shrink:0;">
-                    <a href="/view/{r[0]}" class="btn btng btnsm">Open</a>
+                    <a href="/qrview/{r[0]}" class="btn btng btnsm">View QR</a>
                     <a href="/edit/{r[0]}" class="btn btng btnsm">Edit</a>
                 </div>
             </div>"""
