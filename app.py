@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, session, send_file
+from flask import Flask, request, redirect, session, send_file, url_for
 import sqlite3, os, uuid, qrcode
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
@@ -10,6 +10,19 @@ UPLOADS    = "uploads"
 QRS        = "qrs"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# Stripe — set your real keys here or via environment variables
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "pk_test_YOUR_KEY_HERE")
+STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY",      "sk_test_YOUR_KEY_HERE")
+STRIPE_PRICE_ID        = os.environ.get("STRIPE_PRICE_ID",        "price_YOUR_PRICE_ID")  # $10/mo recurring
+
+# Points milestones: points_needed -> prize label
+MILESTONES = {
+    50:  "Free Month of Pro",
+    150: "Snap2See Branded Hoodie",
+    300: "Amazon Gift Card — $25",
+    500: "iPhone Giveaway Entry",
+}
+
 os.makedirs(UPLOADS, exist_ok=True)
 os.makedirs(QRS,     exist_ok=True)
 
@@ -19,10 +32,12 @@ c    = conn.cursor()
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT,
-    is_pro   INTEGER DEFAULT 0
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    username   TEXT UNIQUE,
+    password   TEXT,
+    is_pro     INTEGER DEFAULT 0,
+    points     INTEGER DEFAULT 0,
+    stripe_id  TEXT
 )""")
 
 c.execute("""
@@ -35,6 +50,14 @@ CREATE TABLE IF NOT EXISTS files (
 )""")
 conn.commit()
 
+# Add columns if upgrading an older db
+for col, definition in [("points", "INTEGER DEFAULT 0"), ("stripe_id", "TEXT")]:
+    try:
+        c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+        conn.commit()
+    except Exception:
+        pass
+
 
 # ── WATERMARK ─────────────────────────────────────────────────────────────────
 def apply_watermark(path, text="Snap2See"):
@@ -42,11 +65,11 @@ def apply_watermark(path, text="Snap2See"):
     if ext not in IMAGE_EXTS:
         return False
     try:
-        img     = Image.open(path).convert("RGBA")
-        w, h    = img.size
-        layer   = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw    = ImageDraw.Draw(layer)
-        fsize   = max(14, min(w, h) // 18)
+        img   = Image.open(path).convert("RGBA")
+        w, h  = img.size
+        layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw  = ImageDraw.Draw(layer)
+        fsize = max(14, min(w, h) // 18)
         try:
             font = ImageFont.truetype(
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", fsize)
@@ -63,6 +86,44 @@ def apply_watermark(path, text="Snap2See"):
         return True
     except Exception:
         return False
+
+
+# ── POINTS HELPERS ────────────────────────────────────────────────────────────
+def get_next_milestone(pts):
+    for threshold, prize in sorted(MILESTONES.items()):
+        if pts < threshold:
+            return threshold, prize
+    last = sorted(MILESTONES.keys())[-1]
+    return None, None
+
+def points_bar_html(pts):
+    nxt, prize = get_next_milestone(pts)
+    if nxt is None:
+        return '<p style="font-size:13px;color:var(--gold);">All milestones reached — contact us to claim your prizes.</p>'
+    pct   = min(100, int(pts / nxt * 100))
+    prev  = 0
+    for t in sorted(MILESTONES.keys()):
+        if t <= pts:
+            prev = t
+    bar_pts = pts - prev
+    bar_max = nxt - prev
+    bar_pct = min(100, int(bar_pts / bar_max * 100)) if bar_max > 0 else 100
+    return f"""
+    <div style="margin-top:4px;">
+        <div style="display:flex;justify-content:space-between;
+            font-size:12px;color:var(--t3);margin-bottom:8px;">
+            <span>{pts} points</span>
+            <span>Next: {nxt} pts — {prize}</span>
+        </div>
+        <div style="height:6px;border-radius:99px;background:rgba(255,255,255,0.08);overflow:hidden;">
+            <div style="height:100%;width:{bar_pct}%;border-radius:99px;
+                background:linear-gradient(90deg,var(--ac),var(--gold));
+                transition:width .4s ease;"></div>
+        </div>
+        <div style="font-size:11px;color:var(--t3);margin-top:6px;">
+            {nxt - pts} more scans to unlock: {prize}
+        </div>
+    </div>"""
 
 
 # ── SHARED CSS ────────────────────────────────────────────────────────────────
@@ -89,13 +150,14 @@ a{color:inherit;text-decoration:none;}
     backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);}
 .glassmd{background:var(--glassmd);border:1px solid var(--gbmd);
     backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);}
-input[type=text],input[type=password]{
+input[type=text],input[type=password],input[type=email],input[type=number]{
     width:100%;padding:13px 16px;background:rgba(255,255,255,0.05);
     border:1px solid var(--gb);border-radius:var(--rmd);
     color:var(--t);font-size:15px;font-family:inherit;outline:none;
     transition:border-color .18s,box-shadow .18s;
 }
-input[type=text]:focus,input[type=password]:focus{
+input[type=text]:focus,input[type=password]:focus,
+input[type=email]:focus,input[type=number]:focus{
     border-color:var(--ac);box-shadow:0 0 0 3px var(--acg);}
 input::placeholder{color:var(--t3);}
 input[type=file]{display:none;}
@@ -163,8 +225,9 @@ def page(title, body, navbar=True):
             Snap<span style="color:var(--ac);">2See</span>
           </a>
           <div class="navr">
-            <a href="/manage"  class="btn btng btnsm">My QRs</a>
-            <a href="/upgrade" class="btn btngold btnsm">Pro</a>
+            <a href="/rewards"  class="btn btng btnsm">Rewards</a>
+            <a href="/manage"   class="btn btng btnsm">My QRs</a>
+            <a href="/upgrade"  class="btn btngold btnsm">Pro</a>
           </div>
         </nav>
         <div style="height:56px;"></div>"""
@@ -191,87 +254,175 @@ def splash():
     body = """
 <style>
 @keyframes logoReveal{
-    0%{opacity:0;transform:scale(.7) translateY(28px);}
-    65%{transform:scale(1.03) translateY(-3px);}
+    0%{opacity:0;transform:scale(.72) translateY(30px);}
+    65%{transform:scale(1.04) translateY(-4px);}
     100%{opacity:1;transform:scale(1) translateY(0);}
 }
-@keyframes ringExpand{
-    0%{transform:scale(1);opacity:.5;}
-    100%{transform:scale(2.2);opacity:0;}
+@keyframes ringOut{
+    0%{transform:scale(1);opacity:.45;}
+    100%{transform:scale(2.4);opacity:0;}
 }
-@keyframes floatUp{
+@keyframes drift{
     0%,100%{transform:translateY(0);}
-    50%{transform:translateY(-9px);}
+    50%{transform:translateY(-10px);}
 }
-@keyframes shimmerText{
+@keyframes shimmer{
     0%{background-position:0% center;}
     100%{background-position:200% center;}
 }
-.hero{min-height:100vh;display:flex;flex-direction:column;align-items:center;
-    justify-content:center;text-align:center;padding:60px 24px 80px;}
-.logoWrap{position:relative;width:120px;height:120px;margin:0 auto 40px;
-    animation:floatUp 7s ease-in-out infinite;}
-.ring{position:absolute;inset:0;border-radius:50%;
-    border:1.5px solid rgba(41,151,255,0.35);animation:ringExpand 2.8s ease-out infinite;}
-.ring:nth-child(2){animation-delay:.9s;}
-.ring:nth-child(3){animation-delay:1.8s;}
-.logoBox{position:relative;z-index:2;width:120px;height:120px;border-radius:32px;
-    background:linear-gradient(145deg,#101828,#0d2340);
-    border:1px solid rgba(41,151,255,0.25);
-    box-shadow:0 24px 64px rgba(41,151,255,0.18),inset 0 1px 0 rgba(255,255,255,0.08);
+@keyframes lineIn{
+    from{width:0;opacity:0;}
+    to{width:60px;opacity:1;}
+}
+
+/* ── Hero ── */
+.hero{
+    min-height:100vh;
+    display:flex;flex-direction:column;
+    align-items:center;justify-content:center;
+    text-align:center;padding:80px 24px 100px;
+}
+.logoWrap{
+    position:relative;width:120px;height:120px;
+    margin:0 auto 48px;animation:drift 8s ease-in-out infinite;
+}
+.ring{
+    position:absolute;inset:0;border-radius:50%;
+    border:1.5px solid rgba(41,151,255,0.3);
+    animation:ringOut 3s ease-out infinite;
+}
+.ring:nth-child(2){animation-delay:1s;}
+.ring:nth-child(3){animation-delay:2s;}
+.logoBox{
+    position:relative;z-index:2;width:120px;height:120px;border-radius:28px;
+    background:linear-gradient(150deg,#0d1b2e,#0a1525);
+    border:1px solid rgba(41,151,255,0.22);
+    box-shadow:0 28px 80px rgba(41,151,255,0.16),inset 0 1px 0 rgba(255,255,255,0.07);
     display:flex;align-items:center;justify-content:center;
-    animation:logoReveal .9s cubic-bezier(.34,1.56,.64,1) both;}
+    animation:logoReveal .85s cubic-bezier(.34,1.56,.64,1) both;
+}
+.heroEyebrow{
+    font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--ac);margin-bottom:20px;
+    animation:fadeUp .5s .1s ease both;opacity:0;animation-fill-mode:forwards;
+}
 .heroTitle{
-    font-size:clamp(42px,8vw,64px);font-weight:700;letter-spacing:-.05em;
-    line-height:1;margin-bottom:18px;
-    background:linear-gradient(100deg,#ffffff 20%,#2997ff 50%,#ffffff 80%);
-    background-size:200% auto;-webkit-background-clip:text;
-    -webkit-text-fill-color:transparent;background-clip:text;
-    animation:shimmerText 4s linear infinite, fadeUp .6s .2s ease both;
+    font-size:clamp(46px,9vw,72px);font-weight:700;
+    letter-spacing:-.055em;line-height:.95;margin-bottom:24px;
+    background:linear-gradient(110deg,#e8e8ed 30%,#2997ff 55%,#e8e8ed 78%);
+    background-size:200% auto;
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+    animation:shimmer 5s linear infinite, fadeUp .55s .18s ease both;
     opacity:0;animation-fill-mode:forwards;
 }
-.heroSub{font-size:18px;color:var(--t2);max-width:460px;margin:0 auto 44px;
-    line-height:1.6;animation:fadeUp .6s .35s ease both;
-    opacity:0;animation-fill-mode:forwards;}
-.pillRow{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;
-    margin-bottom:48px;animation:fadeUp .6s .45s ease both;
-    opacity:0;animation-fill-mode:forwards;}
-.pill{padding:5px 14px;border-radius:20px;font-size:12px;font-weight:500;
-    background:rgba(255,255,255,0.05);border:1px solid var(--gb);
-    color:var(--t2);letter-spacing:.01em;}
-.ctaRow{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;
-    animation:fadeUp .6s .55s ease both;opacity:0;animation-fill-mode:forwards;}
+.heroSub{
+    font-size:19px;color:var(--t2);max-width:500px;
+    margin:0 auto 48px;line-height:1.65;
+    animation:fadeUp .5s .3s ease both;opacity:0;animation-fill-mode:forwards;
+}
+.heroCta{
+    display:flex;gap:12px;flex-wrap:wrap;justify-content:center;
+    animation:fadeUp .5s .42s ease both;opacity:0;animation-fill-mode:forwards;
+}
+.heroCta a{padding:15px 36px;font-size:16px;border-radius:var(--rlg);}
 
-.section{padding:80px 24px;max-width:820px;margin:0 auto;}
-.sectionLabel{font-size:11px;font-weight:600;letter-spacing:.1em;
-    text-transform:uppercase;color:var(--ac);margin-bottom:14px;}
-.sectionTitle{font-size:clamp(28px,5vw,38px);font-weight:700;
-    letter-spacing:-.04em;margin-bottom:18px;line-height:1.15;}
-.sectionBody{font-size:16px;color:var(--t2);line-height:1.75;}
+/* ── Section rule ── */
+.sRule{
+    display:block;width:0;height:2px;background:var(--ac);
+    border-radius:2px;margin-bottom:20px;
+    animation:lineIn .6s .1s ease both;animation-fill-mode:forwards;
+}
 
+/* ── Feature strip ── */
+.strip{
+    border-top:1px solid var(--gb);border-bottom:1px solid var(--gb);
+    padding:40px 24px;
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    gap:0;
+    max-width:900px;margin:0 auto;
+}
+.stripItem{
+    padding:24px 28px;
+    border-right:1px solid var(--gb);
+}
+.stripItem:last-child{border-right:none;}
+.stripNum{
+    font-size:36px;font-weight:700;letter-spacing:-.04em;
+    color:var(--ac);margin-bottom:4px;
+}
+.stripLabel{font-size:13px;color:var(--t2);}
+
+/* ── How it works ── */
+.howWrap{max-width:820px;margin:0 auto;padding:80px 24px;}
+.howLabel{font-size:11px;font-weight:600;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--ac);margin-bottom:16px;}
+.howTitle{font-size:clamp(26px,4vw,36px);font-weight:700;
+    letter-spacing:-.04em;margin-bottom:40px;line-height:1.2;}
+.howGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;}
+.howStep{border-radius:var(--rlg);padding:28px;background:var(--glass);border:1px solid var(--gb);}
+.stepNum{
+    font-size:11px;font-weight:700;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--ac);margin-bottom:14px;
+}
+.howStep h3{font-size:16px;font-weight:600;margin-bottom:8px;letter-spacing:-.01em;}
+.howStep p{font-size:13px;color:var(--t2);line-height:1.65;}
+
+/* ── Rewards section ── */
+.rewardsWrap{
+    background:var(--bg1);border-top:1px solid var(--gb);
+    border-bottom:1px solid var(--gb);
+}
+.rewardsInner{max-width:820px;margin:0 auto;padding:80px 24px;}
+.rewardGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    gap:14px;margin-top:36px;}
+.rewardCard{
+    border-radius:var(--rlg);padding:24px;
+    background:var(--glass);border:1px solid var(--gb);
+    position:relative;overflow:hidden;
+}
+.rewardPts{
+    font-size:28px;font-weight:700;letter-spacing:-.04em;
+    color:var(--gold);margin-bottom:6px;
+}
+.rewardPtsLabel{font-size:11px;color:var(--t3);text-transform:uppercase;
+    letter-spacing:.06em;margin-bottom:12px;}
+.rewardName{font-size:13px;font-weight:500;color:var(--t);}
+.rewardBar{
+    position:absolute;bottom:0;left:0;right:0;height:2px;
+    background:linear-gradient(90deg,var(--ac),var(--gold));
+}
+
+/* ── Why section ── */
+.whyWrap{max-width:820px;margin:0 auto;padding:80px 24px;}
+.whyBody{font-size:16px;color:var(--t2);line-height:1.8;max-width:640px;}
+.whyBody+.whyBody{margin-top:16px;}
 .whyGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
     gap:16px;margin-top:40px;}
-.whyCard{border-radius:var(--rlg);padding:24px;background:var(--glass);
-    border:1px solid var(--gb);}
+.whyCard{border-radius:var(--rlg);padding:24px;background:var(--glass);border:1px solid var(--gb);}
 .whyIcon{width:36px;height:36px;border-radius:10px;
-    background:rgba(41,151,255,0.12);border:1px solid rgba(41,151,255,0.2);
+    background:rgba(41,151,255,0.1);border:1px solid rgba(41,151,255,0.18);
     display:flex;align-items:center;justify-content:center;margin-bottom:14px;}
 .whyCard h3{font-size:15px;font-weight:600;margin-bottom:6px;letter-spacing:-.01em;}
-.whyCard p{font-size:13px;color:var(--t2);line-height:1.6;}
+.whyCard p{font-size:13px;color:var(--t2);line-height:1.65;}
 
+/* ── Privacy ── */
 .policyWrap{background:var(--bg1);border-top:1px solid var(--gb);}
 .policyBlock{max-width:760px;margin:0 auto;padding:72px 24px 80px;}
-.policyBlock h2{font-size:30px;font-weight:700;letter-spacing:-.03em;margin-bottom:6px;}
+.policyBlock h2{font-size:28px;font-weight:700;letter-spacing:-.03em;margin-bottom:6px;}
 .policyUpdated{font-size:12px;color:var(--t3);margin-bottom:36px;}
 .policyItem{margin-bottom:28px;padding-bottom:28px;border-bottom:1px solid var(--gb);}
 .policyItem:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0;}
-.policyItem h3{font-size:16px;font-weight:600;letter-spacing:-.01em;margin-bottom:8px;}
+.policyItem h3{font-size:15px;font-weight:600;margin-bottom:8px;}
 .policyItem p{font-size:14px;color:var(--t2);line-height:1.75;}
 
-footer{border-top:1px solid var(--gb);padding:24px;text-align:center;
+/* ── Footer ── */
+footer{border-top:1px solid var(--gb);padding:28px 24px;text-align:center;
     font-size:12px;color:var(--t3);}
 footer a{color:var(--t3);}
 footer a:hover{color:var(--t2);}
+.footLinks{display:flex;gap:24px;justify-content:center;
+    flex-wrap:wrap;margin:12px 0;}
 </style>
 
 <!-- HERO -->
@@ -281,10 +432,10 @@ footer a:hover{color:var(--t2);}
         <div class="ring"></div>
         <div class="ring"></div>
         <div class="logoBox">
-            <svg width="54" height="54" viewBox="0 0 54 54" fill="none">
-                <rect x="4"  y="4"  width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.5"/>
-                <rect x="32" y="4"  width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.5"/>
-                <rect x="4"  y="32" width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.5"/>
+            <svg width="52" height="52" viewBox="0 0 54 54" fill="none">
+                <rect x="4"  y="4"  width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.4"/>
+                <rect x="32" y="4"  width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.4"/>
+                <rect x="4"  y="32" width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.4"/>
                 <rect x="8"  y="8"  width="10" height="10" rx="1.5" fill="#2997ff"/>
                 <rect x="36" y="8"  width="10" height="10" rx="1.5" fill="#2997ff"/>
                 <rect x="8"  y="36" width="10" height="10" rx="1.5" fill="#2997ff"/>
@@ -295,63 +446,141 @@ footer a:hover{color:var(--t2);}
         </div>
     </div>
 
+    <p class="heroEyebrow">Smart QR Infrastructure</p>
     <h1 class="heroTitle">Snap2See</h1>
     <p class="heroSub">
-        Upload any file. Get a smart QR code instantly.<br>
-        Track every scan in real time.
+        Print once. Update forever. Every scan earns you points
+        toward real prizes — free months, gear, and more.
     </p>
-
-    <div class="pillRow">
-        <div class="pill">Scan Analytics</div>
-        <div class="pill">Dynamic Content</div>
-        <div class="pill">Instant Deploy</div>
-        <div class="pill">Auto Watermarking</div>
-        <div class="pill">Secure Links</div>
-    </div>
-
-    <div class="ctaRow">
-        <a href="/login" class="btn btnp"
-            style="padding:15px 36px;font-size:16px;border-radius:var(--rlg);">
-            Get Started
-        </a>
-        <a href="#why" class="btn btng"
-            style="padding:15px 36px;font-size:16px;border-radius:var(--rlg);">
-            Learn More
-        </a>
+    <div class="heroCta">
+        <a href="/login" class="btn btnp">Create an Account</a>
+        <a href="#how"   class="btn btng">See How It Works</a>
     </div>
 </section>
 
-<!-- WHY WE BUILT THIS -->
+<!-- STRIP STATS -->
 <div style="border-top:1px solid var(--gb);">
-<section class="section" id="why">
-    <div class="sectionLabel">Our Story</div>
-    <h2 class="sectionTitle">Why we built Snap2See</h2>
-    <p class="sectionBody">
-        We got frustrated with QR codes that broke the moment a link changed. You print a
-        hundred flyers, then update your menu or portfolio — and suddenly every QR is useless.
-        Snap2See solves that: the physical QR code you print today can serve entirely different
-        content tomorrow, with no reprinting required.
-    </p>
-    <p class="sectionBody" style="margin-top:16px;">
-        We also believed every image shared via QR should carry its source with it. Watermarking
-        is automatic and invisible to set up — protecting creators without any extra steps.
-        Analytics are built in from day one, because knowing how people engage with your content
-        matters whether you are a freelancer, a restaurant owner, or a growing team.
-    </p>
+<div class="strip">
+    <div class="stripItem">
+        <div class="stripNum">1 pt</div>
+        <div class="stripLabel">earned per scan on your QRs</div>
+    </div>
+    <div class="stripItem">
+        <div class="stripNum">50 pts</div>
+        <div class="stripLabel">unlocks your first prize</div>
+    </div>
+    <div class="stripItem">
+        <div class="stripNum">Dynamic</div>
+        <div class="stripLabel">update content, keep the same QR</div>
+    </div>
+    <div class="stripItem" style="border-right:none;">
+        <div class="stripNum">Auto</div>
+        <div class="stripLabel">watermark on every image upload</div>
+    </div>
+</div>
+</div>
 
-    <div class="whyGrid">
+<!-- HOW IT WORKS -->
+<div id="how" style="border-top:1px solid var(--gb);">
+<div class="howWrap">
+    <div class="howLabel">The Process</div>
+    <h2 class="howTitle">Three steps from upload to live QR</h2>
+    <div class="howGrid">
+        <div class="howStep">
+            <div class="stepNum">Step 01</div>
+            <h3>Upload your file</h3>
+            <p>Drop in any image, PDF, video, or document. We store it securely and watermark images automatically.</p>
+        </div>
+        <div class="howStep">
+            <div class="stepNum">Step 02</div>
+            <h3>Get your QR code</h3>
+            <p>A unique QR is generated instantly. Print it, share it, stick it anywhere — the link never expires.</p>
+        </div>
+        <div class="howStep">
+            <div class="stepNum">Step 03</div>
+            <h3>Earn points per scan</h3>
+            <p>Every time someone scans your QR, you earn one point. Rack them up and redeem for real rewards.</p>
+        </div>
+        <div class="howStep">
+            <div class="stepNum">Step 04</div>
+            <h3>Swap content anytime</h3>
+            <p>The printed QR never changes. The file it delivers can be replaced in seconds from your dashboard.</p>
+        </div>
+    </div>
+</div>
+</div>
+
+<!-- REWARDS -->
+<div class="rewardsWrap" id="rewards">
+<div class="rewardsInner">
+    <div class="howLabel">Scan Rewards</div>
+    <h2 class="howTitle" style="margin-bottom:10px;">Points that mean something</h2>
+    <p style="font-size:15px;color:var(--t2);max-width:520px;line-height:1.7;margin-bottom:0;">
+        Every scan of any QR code you own adds one point to your account.
+        Hit a milestone and we reach out to arrange your prize.
+        No catch, no fine print.
+    </p>
+    <div class="rewardGrid">
+        <div class="rewardCard">
+            <div class="rewardPts">50</div>
+            <div class="rewardPtsLabel">points</div>
+            <div class="rewardName">Free Month of Pro</div>
+            <div class="rewardBar"></div>
+        </div>
+        <div class="rewardCard">
+            <div class="rewardPts">150</div>
+            <div class="rewardPtsLabel">points</div>
+            <div class="rewardName">Snap2See Branded Hoodie</div>
+            <div class="rewardBar"></div>
+        </div>
+        <div class="rewardCard">
+            <div class="rewardPts">300</div>
+            <div class="rewardPtsLabel">points</div>
+            <div class="rewardName">Amazon Gift Card — $25</div>
+            <div class="rewardBar"></div>
+        </div>
+        <div class="rewardCard">
+            <div class="rewardPts">500</div>
+            <div class="rewardPtsLabel">points</div>
+            <div class="rewardName">iPhone Giveaway Entry</div>
+            <div class="rewardBar"></div>
+        </div>
+    </div>
+</div>
+</div>
+
+<!-- WHY WE BUILT THIS -->
+<div style="border-top:1px solid var(--gb);" id="why">
+<div class="whyWrap">
+    <div class="howLabel">Our Story</div>
+    <h2 class="howTitle" style="margin-bottom:24px;">Why we built Snap2See</h2>
+    <p class="whyBody">
+        The problem was simple: you print flyers, cards, menus — and then something changes.
+        A new menu item. A new portfolio piece. A different event link. Suddenly every QR code
+        you printed is dead, and reprinting costs money you did not budget for.
+    </p>
+    <p class="whyBody">
+        Snap2See separates the QR code from the content it points to. The code is permanent.
+        The content is not. You swap the file from your dashboard and every printed QR in the
+        world instantly serves the new version — no reprint, no downtime.
+    </p>
+    <p class="whyBody" style="margin-top:16px;">
+        The rewards system came from watching creators share their QR codes and get nothing back
+        for the effort of growing an audience. Scans are engagement. Engagement should have value.
+        So we built a points system that turns every scan into something tangible.
+    </p>
+    <div class="whyGrid" style="margin-top:40px;">
         <div class="whyCard">
             <div class="whyIcon">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
                     stroke="#2997ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3" y="3" width="7" height="7" rx="1"/>
-                    <rect x="14" y="3" width="7" height="7" rx="1"/>
-                    <rect x="3" y="14" width="7" height="7" rx="1"/>
-                    <rect x="14" y="14" width="7" height="7" rx="1"/>
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
                 </svg>
             </div>
-            <h3>Dynamic QR Codes</h3>
-            <p>The URL printed on paper never changes. The file it delivers can be swapped any time from your dashboard.</p>
+            <h3>Permanent QR, live content</h3>
+            <p>Print once and never touch the physical code again. Change the file behind it whenever you need to.</p>
         </div>
         <div class="whyCard">
             <div class="whyIcon">
@@ -360,18 +589,19 @@ footer a:hover{color:var(--t2);}
                     <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
                 </svg>
             </div>
-            <h3>Creator Protection</h3>
-            <p>Every image file receives a Snap2See watermark automatically, so credit follows your work wherever it travels.</p>
+            <h3>Creator attribution built in</h3>
+            <p>Images are watermarked the moment they are uploaded. Your name travels with your work, automatically.</p>
         </div>
         <div class="whyCard">
             <div class="whyIcon">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
                     stroke="#2997ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                    <circle cx="12" cy="8" r="6"/>
+                    <path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/>
                 </svg>
             </div>
-            <h3>Real-Time Analytics</h3>
-            <p>Watch your scan count grow with every visit. Know which QR codes are performing and which need attention.</p>
+            <h3>Scans become rewards</h3>
+            <p>Every time your QR is scanned you earn a point. Points unlock real prizes at real milestones.</p>
         </div>
         <div class="whyCard">
             <div class="whyIcon">
@@ -381,75 +611,72 @@ footer a:hover{color:var(--t2);}
                     <path d="M7 11V7a5 5 0 0110 0v4"/>
                 </svg>
             </div>
-            <h3>Private by Default</h3>
-            <p>Files are accessible only through unique randomly generated links embedded in your QR code — nothing is publicly indexed.</p>
+            <h3>Private by default</h3>
+            <p>Your files sit behind randomly generated UUIDs. Nothing is publicly listed or indexed.</p>
         </div>
     </div>
-</section>
+</div>
 </div>
 
 <!-- PRIVACY POLICY -->
 <div class="policyWrap" id="privacy">
     <div class="policyBlock">
-        <div class="sectionLabel">Legal</div>
+        <div class="howLabel">Legal</div>
         <h2>Privacy Policy</h2>
         <p class="policyUpdated">Last updated: January 2025</p>
-
         <div class="policyItem">
             <h3>Information We Collect</h3>
-            <p>We collect the username and password you provide at registration, the files you upload
-            to generate QR codes, and aggregate scan count data — a number only, not identifying
-            information about who scanned. We do not collect email addresses, phone numbers, or
-            payment information beyond what a future payment processor would handle independently.</p>
+            <p>We collect the username and password you provide at registration, files you upload
+            to generate QR codes, and a scan count per QR code. Scan counts are aggregate numbers
+            only — we do not log identifying information about the people who scan your codes.
+            We do not collect email addresses unless you provide one voluntarily.</p>
         </div>
         <div class="policyItem">
             <h3>How We Use Your Data</h3>
-            <p>Your uploaded files are stored solely to serve them when a QR code is scanned.
-            Scan counts are used to display analytics on your dashboard. We do not sell, rent,
-            or share any of your data with third parties for advertising or profiling purposes.</p>
+            <p>Files are stored solely to serve them when a QR code is scanned. Scan counts
+            drive the points system and your dashboard analytics. We do not sell, rent, or share
+            any of your data with third parties for advertising purposes.</p>
+        </div>
+        <div class="policyItem">
+            <h3>Payments</h3>
+            <p>Pro subscriptions are processed through Stripe. We never see or store your card
+            details. Stripe's privacy policy governs all payment data. Your subscription status
+            is stored as a flag in our database only.</p>
         </div>
         <div class="policyItem">
             <h3>File Storage and Watermarking</h3>
-            <p>Files are stored on the server running this application. Images are automatically
-            watermarked with "Snap2See" before being saved, to protect creator attribution.
-            You retain full ownership of all files you upload. You may delete any file at any
-            time from the Manage QRs page.</p>
+            <p>Files are stored on the server running this application. Images are watermarked
+            with "Snap2See" on upload to protect creator attribution. You retain ownership of
+            all files you upload and may delete them at any time from the Manage QRs page.</p>
         </div>
         <div class="policyItem">
             <h3>Cookies and Sessions</h3>
-            <p>We use a single server-side session cookie to keep you logged in. This cookie
-            contains only a session identifier — no personal data. It expires when you close
-            your browser or log out. We use no third-party tracking cookies, analytics pixels,
-            or advertising scripts of any kind.</p>
+            <p>We use a single session cookie to keep you logged in. It contains only a session
+            identifier — no personal data. We use no third-party tracking, analytics pixels,
+            or advertising scripts.</p>
         </div>
         <div class="policyItem">
             <h3>Data Retention</h3>
-            <p>Your account and associated files remain stored until you delete them or request
-            account deletion. To request deletion of all your data, contact us directly.
-            We will process your request within 30 days of verification.</p>
+            <p>Your account and files remain stored until you delete them or request account
+            removal. Contact us directly for deletion requests; we process them within 30 days.</p>
         </div>
         <div class="policyItem">
             <h3>Security</h3>
-            <p>Files are accessible only through unique, randomly generated UUIDs embedded in
-            QR codes. We recommend treating your QR link as a private URL. Snap2See does not
-            currently encrypt files at rest — please do not upload files containing sensitive
-            personal, financial, or confidential information.</p>
-        </div>
-        <div class="policyItem">
-            <h3>Changes to This Policy</h3>
-            <p>If we make material changes to this policy we will update the date shown above.
-            Continued use of the service after changes are posted constitutes your acceptance
-            of the updated policy.</p>
+            <p>Files are accessible only through randomly generated UUID links. Do not upload
+            files containing sensitive personal, financial, or confidential information as we
+            do not currently encrypt files at rest.</p>
         </div>
     </div>
 </div>
 
 <footer>
-    <div style="margin-bottom:10px;font-size:15px;font-weight:700;letter-spacing:-.03em;">
+    <div style="font-size:16px;font-weight:700;letter-spacing:-.04em;margin-bottom:4px;">
         Snap<span style="color:var(--ac);">2See</span>
     </div>
-    <div style="display:flex;gap:20px;justify-content:center;margin-bottom:12px;">
-        <a href="#why">Why we built this</a>
+    <div class="footLinks">
+        <a href="#how">How It Works</a>
+        <a href="#rewards">Rewards</a>
+        <a href="#why">Our Story</a>
         <a href="#privacy">Privacy Policy</a>
         <a href="/login">Sign In</a>
     </div>
@@ -483,21 +710,21 @@ def login():
                 session["user_id"] = row[0]
                 return redirect("/dashboard")
 
-    err_html = (f'<p style="color:var(--red);font-size:13px;margin-bottom:12px;'
-                f'padding:10px 14px;background:rgba(255,69,58,0.08);'
-                f'border:1px solid rgba(255,69,58,0.18);border-radius:var(--rsm);">'
-                f'{error}</p>') if error else ""
+    err_html = (
+        f'<p style="color:var(--red);font-size:13px;margin-bottom:12px;padding:10px 14px;'
+        f'background:rgba(255,69,58,0.08);border:1px solid rgba(255,69,58,0.18);'
+        f'border-radius:var(--rsm);">{error}</p>'
+    ) if error else ""
 
     body = f"""
 <style>
-.loginOuter{{min-height:100vh;display:flex;align-items:center;
-    justify-content:center;padding:40px 24px;}}
-.loginCard{{width:100%;max-width:400px;border-radius:var(--rxl);padding:40px 36px;}}
+.lo{{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:40px 24px;}}
+.lc{{width:100%;max-width:400px;border-radius:var(--rxl);padding:40px 36px;}}
 </style>
-<div class="loginOuter">
-    <div class="loginCard glassmd a0">
+<div class="lo">
+    <div class="lc glassmd a0">
         <div style="text-align:center;margin-bottom:32px;">
-            <svg width="42" height="42" viewBox="0 0 54 54" fill="none"
+            <svg width="40" height="40" viewBox="0 0 54 54" fill="none"
                 style="margin:0 auto 14px;display:block;">
                 <rect x="4"  y="4"  width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.5"/>
                 <rect x="32" y="4"  width="18" height="18" rx="3" stroke="#2997ff" stroke-width="2.5"/>
@@ -509,16 +736,12 @@ def login():
                 <rect x="41" y="32" width="9"  height="5"  rx="1" fill="rgba(41,151,255,.5)"/>
                 <rect x="32" y="41" width="18" height="5"  rx="1" fill="rgba(41,151,255,.5)"/>
             </svg>
-            <h1 style="font-size:24px;font-weight:700;letter-spacing:-.03em;margin-bottom:6px;">
+            <h1 style="font-size:22px;font-weight:700;letter-spacing:-.03em;margin-bottom:6px;">
                 Sign in to Snap2See
             </h1>
-            <p style="font-size:14px;color:var(--t2);">
-                New here? Signing in creates your account.
-            </p>
+            <p style="font-size:14px;color:var(--t2);">New? Signing in creates your account.</p>
         </div>
-
         {err_html}
-
         <form method="post" style="display:flex;flex-direction:column;gap:12px;">
             <input type="text"     name="username" placeholder="Username" required autofocus>
             <input type="password" name="password" placeholder="Password" required>
@@ -527,8 +750,7 @@ def login():
                 Continue
             </button>
         </form>
-
-        <hr class="divider" style="margin:24px 0;">
+        <hr class="divider" style="margin:22px 0;">
         <div style="text-align:center;">
             <a href="/" style="font-size:13px;color:var(--t3);">Back to home</a>
         </div>
@@ -538,53 +760,34 @@ def login():
     return page("Sign In", body, navbar=False)
 
 
+# ── LOGOUT ────────────────────────────────────────────────────────────────────
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+
 # ── DASHBOARD ────────────────────────────────────────────────────────────────
 @app.route("/dashboard")
 def dashboard():
     if "user_id" not in session:
         return redirect("/login")
-
-    c.execute("SELECT is_pro, username FROM users WHERE id=?", (session["user_id"],))
+    c.execute("SELECT is_pro, username, points FROM users WHERE id=?", (session["user_id"],))
     row = c.fetchone()
     if not row:
         return redirect("/login")
-    pro, username = row
+    pro, username, pts = row[0], row[1], row[2] or 0
 
     c.execute("SELECT COUNT(*) FROM files WHERE user_id=?", (session["user_id"],))
     qr_count = c.fetchone()[0]
-
     c.execute("SELECT COALESCE(SUM(scans),0) FROM files WHERE user_id=?", (session["user_id"],))
     total_scans = c.fetchone()[0]
 
-    plan_badge = ('<span class="badge badgepro">Pro</span>' if pro
-                  else '<span class="badge badgefree">Free</span>')
-    plan_color = "var(--gold)" if pro else "var(--t2)"
-    plan_label = "Pro" if pro else "Free"
-    plan_sub   = "Unlimited QRs" if pro else "Upgrade for more"
-
-    analytics_card = (
-        '<a href="/manage" class="btn btng" style="padding:18px 20px;border-radius:var(--rlg);'
-        'justify-content:flex-start;gap:14px;">'
-        '<span style="display:flex;align-items:center;justify-content:center;width:36px;height:36px;'
-        'border-radius:10px;background:rgba(41,151,255,0.1);flex-shrink:0;">'
-        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--ac)" '
-        'stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>'
-        '</svg></span>'
-        '<div style="text-align:left;"><div style="font-size:14px;font-weight:500;">Analytics</div>'
-        '<div style="font-size:12px;color:var(--t2);">Scan statistics</div></div></a>'
-        if pro else
-        '<a href="/upgrade" class="btn" style="padding:18px 20px;border-radius:var(--rlg);'
-        'justify-content:flex-start;gap:14px;background:rgba(255,214,10,0.06);'
-        'border:1px solid rgba(255,214,10,0.18);">'
-        '<span style="display:flex;align-items:center;justify-content:center;width:36px;height:36px;'
-        'border-radius:10px;background:rgba(255,214,10,0.12);flex-shrink:0;">'
-        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--gold)" '
-        'stroke-width="2" stroke-linecap="round">'
-        '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>'
-        '</svg></span>'
-        '<div style="text-align:left;"><div style="font-size:14px;font-weight:500;color:var(--gold);">Upgrade to Pro</div>'
-        '<div style="font-size:12px;color:var(--t2);">Unlock all features</div></div></a>'
-    )
+    plan_badge  = '<span class="badge badgepro">Pro</span>' if pro else '<span class="badge badgefree">Free</span>'
+    plan_color  = "var(--gold)" if pro else "var(--t2)"
+    plan_label  = "Pro" if pro else "Free"
+    plan_sub    = "Unlimited QRs" if pro else "Upgrade for more"
+    bar_html    = points_bar_html(pts)
 
     body = f"""
 <div class="pw">
@@ -593,15 +796,17 @@ def dashboard():
         <div>
             <p style="font-size:12px;color:var(--t3);margin-bottom:4px;
                 text-transform:uppercase;letter-spacing:.06em;font-weight:500;">Dashboard</p>
-            <h1 style="font-size:28px;font-weight:700;letter-spacing:-.04em;">
-                Hello, {username}
-            </h1>
+            <h1 style="font-size:28px;font-weight:700;letter-spacing:-.04em;">Hello, {username}</h1>
         </div>
-        {plan_badge}
+        <div style="display:flex;gap:8px;align-items:center;">
+            {plan_badge}
+            <a href="/logout" class="btn btng btnsm">Sign Out</a>
+        </div>
     </div>
 
+    <!-- Stats -->
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-        gap:12px;margin-bottom:28px;" class="a1">
+        gap:12px;margin-bottom:20px;" class="a1">
         <div class="stat">
             <div class="statval">{qr_count}</div>
             <div class="statlbl">QR Codes</div>
@@ -611,25 +816,36 @@ def dashboard():
             <div class="statlbl">Total Scans</div>
         </div>
         <div class="stat">
-            <div class="statval" style="color:{plan_color};font-size:28px;">{plan_label}</div>
+            <div class="statval" style="color:var(--gold);">{pts}</div>
+            <div class="statlbl">Points</div>
+        </div>
+        <div class="stat">
+            <div class="statval" style="color:{plan_color};font-size:26px;">{plan_label}</div>
             <div class="statlbl">{plan_sub}</div>
         </div>
     </div>
 
+    <!-- Points bar -->
+    <div class="glass a2" style="border-radius:var(--rlg);padding:20px 24px;margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:500;margin-bottom:10px;">Scan Rewards Progress</div>
+        {bar_html}
+        <div style="margin-top:12px;">
+            <a href="/rewards" style="font-size:13px;color:var(--ac);">View all milestones</a>
+        </div>
+    </div>
+
+    <!-- Upload -->
     <div class="glass a2" style="border-radius:var(--rxl);padding:32px;margin-bottom:20px;">
         <h2 style="font-size:18px;font-weight:600;letter-spacing:-.02em;margin-bottom:6px;">
             Create a QR Code
         </h2>
         <p style="font-size:14px;color:var(--t2);margin-bottom:24px;">
-            Upload any file — image, PDF, video, or document — and receive a scannable
-            QR code instantly. Images are watermarked automatically.
+            Upload any file — image, PDF, video, or document. Images are watermarked automatically.
         </p>
         <form action="/upload" method="post" enctype="multipart/form-data">
             <input type="file" name="file" id="fi" required
                 onchange="document.getElementById('fl').textContent=this.files[0].name;">
-            <label for="fi" class="filedrop" id="fl">
-                Click to choose a file, or drag and drop here
-            </label>
+            <label for="fi" class="filedrop" id="fl">Click to choose a file</label>
             <button type="submit" class="btn btnp"
                 style="width:100%;margin-top:14px;padding:14px;border-radius:var(--rmd);">
                 Generate QR Code
@@ -637,12 +853,12 @@ def dashboard():
         </form>
     </div>
 
+    <!-- Quick actions -->
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;" class="a3">
         <a href="/manage" class="btn btng"
             style="padding:18px 20px;border-radius:var(--rlg);justify-content:flex-start;gap:14px;">
             <span style="display:flex;align-items:center;justify-content:center;
-                width:36px;height:36px;border-radius:10px;
-                background:rgba(255,255,255,0.06);flex-shrink:0;">
+                width:36px;height:36px;border-radius:10px;background:rgba(255,255,255,0.06);flex-shrink:0;">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
                     stroke="currentColor" stroke-width="2" stroke-linecap="round">
                     <rect x="3" y="3" width="7" height="7" rx="1"/>
@@ -656,32 +872,151 @@ def dashboard():
                 <div style="font-size:12px;color:var(--t2);">View and manage</div>
             </div>
         </a>
-        {analytics_card}
+        <a href="/rewards" class="btn btng"
+            style="padding:18px 20px;border-radius:var(--rlg);justify-content:flex-start;gap:14px;">
+            <span style="display:flex;align-items:center;justify-content:center;
+                width:36px;height:36px;border-radius:10px;background:rgba(255,214,10,0.1);flex-shrink:0;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                    stroke="var(--gold)" stroke-width="2" stroke-linecap="round">
+                    <circle cx="12" cy="8" r="6"/>
+                    <path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/>
+                </svg>
+            </span>
+            <div style="text-align:left;">
+                <div style="font-size:14px;font-weight:500;">My Rewards</div>
+                <div style="font-size:12px;color:var(--t2);">{pts} points earned</div>
+            </div>
+        </a>
     </div>
 </div>
 """
     return page("Dashboard", body)
 
 
-# ── UPGRADE ───────────────────────────────────────────────────────────────────
+# ── REWARDS PAGE ──────────────────────────────────────────────────────────────
+@app.route("/rewards")
+def rewards():
+    if "user_id" not in session:
+        return redirect("/login")
+    c.execute("SELECT points, username FROM users WHERE id=?", (session["user_id"],))
+    row = c.fetchone()
+    pts, username = (row[0] or 0), row[1]
+
+    milestone_html = ""
+    for threshold, prize in sorted(MILESTONES.items()):
+        unlocked = pts >= threshold
+        pct      = min(100, int(pts / threshold * 100))
+        color    = "var(--green)" if unlocked else "var(--t3)"
+        bg       = "rgba(50,215,75,0.08)" if unlocked else "var(--glass)"
+        border   = "rgba(50,215,75,0.2)" if unlocked else "var(--gb)"
+        status   = "Unlocked" if unlocked else f"{threshold - pts} pts away"
+        check    = """<div style="width:22px;height:22px;border-radius:50%;
+            background:rgba(50,215,75,0.15);border:1px solid rgba(50,215,75,0.3);
+            display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
+                stroke="var(--green)" stroke-width="2.5" stroke-linecap="round">
+                <polyline points="2 6 5 9 10 3"/>
+            </svg></div>""" if unlocked else f"""<div style="width:22px;height:22px;
+            border-radius:50%;background:rgba(255,255,255,0.05);
+            border:1px solid var(--gb);flex-shrink:0;"></div>"""
+
+        milestone_html += f"""
+        <div style="border-radius:var(--rlg);padding:20px 24px;
+            background:{bg};border:1px solid {border};
+            display:flex;align-items:center;gap:16px;margin-bottom:10px;">
+            {check}
+            <div style="flex:1;min-width:0;">
+                <div style="font-size:15px;font-weight:500;margin-bottom:3px;">{prize}</div>
+                <div style="height:4px;border-radius:99px;
+                    background:rgba(255,255,255,0.07);overflow:hidden;margin-bottom:4px;">
+                    <div style="height:100%;width:{pct}%;border-radius:99px;
+                        background:{'var(--green)' if unlocked else 'linear-gradient(90deg,var(--ac),var(--gold))'};"></div>
+                </div>
+                <div style="font-size:12px;color:{color};">{status}</div>
+            </div>
+            <div style="text-align:right;flex-shrink:0;">
+                <div style="font-size:22px;font-weight:700;
+                    letter-spacing:-.03em;color:var(--gold);">{threshold}</div>
+                <div style="font-size:11px;color:var(--t3);text-transform:uppercase;
+                    letter-spacing:.04em;">pts</div>
+            </div>
+        </div>"""
+
+    body = f"""
+<div class="pw">
+    <div class="a0" style="margin-bottom:32px;">
+        <p style="font-size:12px;color:var(--t3);text-transform:uppercase;
+            letter-spacing:.06em;font-weight:500;margin-bottom:4px;">Scan Rewards</p>
+        <h1 style="font-size:26px;font-weight:700;letter-spacing:-.04em;margin-bottom:6px;">
+            Your Points
+        </h1>
+        <p style="font-size:15px;color:var(--t2);">
+            Every scan of your QR codes earns 1 point. Hit a milestone and we'll be in touch.
+        </p>
+    </div>
+
+    <!-- Big points display -->
+    <div class="glass a1" style="border-radius:var(--rxl);padding:32px;
+        text-align:center;margin-bottom:28px;
+        background:linear-gradient(135deg,rgba(255,214,10,0.05),rgba(41,151,255,0.05));">
+        <div style="font-size:72px;font-weight:700;letter-spacing:-.05em;
+            color:var(--gold);line-height:1;">{pts}</div>
+        <div style="font-size:14px;color:var(--t2);margin-top:8px;margin-bottom:20px;">
+            points earned, {username}
+        </div>
+        {points_bar_html(pts)}
+    </div>
+
+    <!-- Milestones -->
+    <h2 style="font-size:17px;font-weight:600;letter-spacing:-.02em;
+        margin-bottom:16px;" class="a2">All Milestones</h2>
+    <div class="a2">{milestone_html}</div>
+
+    <div class="glass a3" style="border-radius:var(--rlg);padding:18px 22px;
+        margin-top:20px;font-size:13px;color:var(--t2);line-height:1.65;">
+        When you reach a milestone, we will contact you using the username registered on your
+        account. Make sure your username is something we can identify you by, or reach out to
+        us directly after hitting a milestone to arrange your prize.
+    </div>
+</div>
+"""
+    return page("My Rewards", body)
+
+
+# ── UPGRADE — Stripe ──────────────────────────────────────────────────────────
 @app.route("/upgrade", methods=["GET", "POST"])
 def upgrade():
     if "user_id" not in session:
         return redirect("/login")
-    if request.method == "POST":
-        c.execute("UPDATE users SET is_pro=1 WHERE id=?", (session["user_id"],))
-        conn.commit()
-        return redirect("/dashboard")
 
-    body = """
+    c.execute("SELECT is_pro FROM users WHERE id=?", (session["user_id"],))
+    row = c.fetchone()
+    already_pro = row and row[0] == 1
+
+    stripe_key = STRIPE_PUBLISHABLE_KEY
+    price_id   = STRIPE_PRICE_ID
+
+    body = f"""
 <style>
-.feat{display:flex;align-items:center;gap:10px;padding:11px 0;
-    border-bottom:1px solid var(--gb);font-size:14px;color:var(--t2);}
-.feat:last-child{border-bottom:none;}
-.fcheck{width:20px;height:20px;border-radius:50%;background:rgba(50,215,75,0.15);
+.feat{{display:flex;align-items:center;gap:10px;padding:11px 0;
+    border-bottom:1px solid var(--gb);font-size:14px;color:var(--t2);}}
+.feat:last-child{{border-bottom:none;}}
+.fcheck{{width:20px;height:20px;border-radius:50%;background:rgba(50,215,75,0.15);
     border:1px solid rgba(50,215,75,0.25);display:flex;align-items:center;
-    justify-content:center;flex-shrink:0;}
+    justify-content:center;flex-shrink:0;}}
+#payment-form{{margin-top:24px;}}
+#card-element{{
+    padding:14px 16px;
+    background:rgba(255,255,255,0.05);
+    border:1px solid var(--gb);
+    border-radius:var(--rmd);
+    margin-bottom:14px;
+}}
+#card-errors{{color:var(--red);font-size:13px;margin-bottom:12px;}}
 </style>
+
+{"<div class='pw' style='max-width:520px;text-align:center;padding-top:80px;'><div class='glass' style='border-radius:var(--rxl);padding:40px;'><div style='font-size:48px;font-weight:700;color:var(--gold);margin-bottom:12px;'>Pro</div><p style='color:var(--t2);font-size:16px;margin-bottom:20px;'>You are already on the Pro plan.</p><a href=\"/dashboard\" class=\"btn btnp\">Back to Dashboard</a></div></div>"
+  if already_pro else f'''
 <div class="pw" style="max-width:520px;">
     <div style="text-align:center;margin-bottom:40px;" class="a0">
         <div style="display:inline-flex;align-items:center;justify-content:center;
@@ -697,14 +1032,14 @@ def upgrade():
             Snap2See Pro
         </h1>
         <p style="color:var(--t2);font-size:16px;">
-            Everything you need for powerful QR campaigns.
+            Billed monthly at $10. Cancel any time.
         </p>
     </div>
 
     <div class="glass a1" style="border-radius:var(--rxl);padding:32px;
         border:1px solid rgba(255,214,10,0.2);position:relative;overflow:hidden;">
         <div style="position:absolute;top:0;right:0;width:220px;height:220px;
-            background:radial-gradient(circle at top right,rgba(255,214,10,0.07),transparent 65%);
+            background:radial-gradient(circle at top right,rgba(255,214,10,0.06),transparent 65%);
             pointer-events:none;"></div>
 
         <div style="display:flex;justify-content:space-between;align-items:flex-start;
@@ -713,36 +1048,140 @@ def upgrade():
                 <div style="font-size:11px;font-weight:600;text-transform:uppercase;
                     letter-spacing:.08em;color:var(--gold);margin-bottom:8px;">Pro Plan</div>
                 <div style="font-size:42px;font-weight:700;letter-spacing:-.05em;line-height:1;">
-                    $10
-                    <span style="font-size:17px;font-weight:400;color:var(--t2);">/ month</span>
+                    $10<span style="font-size:16px;font-weight:400;color:var(--t2);">/ mo</span>
                 </div>
             </div>
             <span class="badge badgepro">Most Popular</span>
         </div>
 
-        <div>
+        <div style="margin-bottom:28px;">
             <div class="feat"><div class="fcheck"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round"><polyline points="2 6 5 9 10 3"/></svg></div>Unlimited QR codes</div>
             <div class="feat"><div class="fcheck"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round"><polyline points="2 6 5 9 10 3"/></svg></div>Swap file content without reprinting</div>
             <div class="feat"><div class="fcheck"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round"><polyline points="2 6 5 9 10 3"/></svg></div>Advanced scan analytics</div>
             <div class="feat"><div class="fcheck"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round"><polyline points="2 6 5 9 10 3"/></svg></div>Custom watermark branding</div>
-            <div class="feat"><div class="fcheck"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round"><polyline points="2 6 5 9 10 3"/></svg></div>Bulk QR generation</div>
             <div class="feat"><div class="fcheck"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round"><polyline points="2 6 5 9 10 3"/></svg></div>Priority support</div>
         </div>
 
-        <form method="post" style="margin-top:28px;">
-            <button type="submit" class="btn btngold"
-                style="width:100%;padding:15px;font-size:16px;border-radius:var(--rmd);">
-                Activate Pro — Demo
-            </button>
-        </form>
+        <!-- Stripe Card Element -->
+        <div id="card-errors"></div>
+        <div id="card-element"></div>
+        <button id="pay-btn" class="btn btngold" style="width:100%;padding:15px;font-size:16px;border-radius:var(--rmd);">
+            Subscribe — $10 / month
+        </button>
+
+        <p style="font-size:12px;color:var(--t3);text-align:center;margin-top:14px;">
+            Secured by Stripe. Cancel any time from your account.
+        </p>
     </div>
 
     <div style="text-align:center;margin-top:20px;" class="a2">
         <a href="/dashboard" style="font-size:13px;color:var(--t3);">Back to dashboard</a>
     </div>
 </div>
+
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+var stripe  = Stripe('{stripe_key}');
+var elements = stripe.elements();
+var style = {{
+    base:{{
+        color:'#f2f2f7',
+        fontFamily:'-apple-system,BlinkMacSystemFont,SF Pro Text,sans-serif',
+        fontSize:'15px',
+        '::placeholder':{{color:'#58585f'}}
+    }},
+    invalid:{{color:'#ff453a'}}
+}};
+var card = elements.create('card', {{style:style}});
+card.mount('#card-element');
+
+card.on('change', function(e){{
+    document.getElementById('card-errors').textContent = e.error ? e.error.message : '';
+}});
+
+document.getElementById('pay-btn').addEventListener('click', async function(){{
+    this.disabled = true;
+    this.textContent = 'Processing...';
+
+    const resp = await fetch('/create-payment-intent', {{method:'POST'}});
+    const data = await resp.json();
+
+    if(data.error){{
+        document.getElementById('card-errors').textContent = data.error;
+        this.disabled = false;
+        this.textContent = 'Subscribe — $10 / month';
+        return;
+    }}
+
+    const result = await stripe.confirmCardPayment(data.clientSecret, {{
+        payment_method:{{card:card}}
+    }});
+
+    if(result.error){{
+        document.getElementById('card-errors').textContent = result.error.message;
+        this.disabled = false;
+        this.textContent = 'Subscribe — $10 / month';
+    }} else if(result.paymentIntent.status === 'succeeded'){{
+        window.location.href = '/payment-success';
+    }}
+}});
+</script>
+'''}
 """
     return page("Upgrade to Pro", body)
+
+
+# ── STRIPE PAYMENT INTENT ────────────────────────────────────────────────────
+@app.route("/create-payment-intent", methods=["POST"])
+def create_payment_intent():
+    if "user_id" not in session:
+        from flask import jsonify
+        return jsonify({"error": "Not logged in"}), 401
+    try:
+        import stripe as stripe_lib
+        stripe_lib.api_key = STRIPE_SECRET_KEY
+        intent = stripe_lib.PaymentIntent.create(
+            amount=1000,          # $10.00 in cents
+            currency="usd",
+            automatic_payment_methods={"enabled": True},
+            metadata={"user_id": str(session["user_id"])}
+        )
+        from flask import jsonify
+        return jsonify({"clientSecret": intent.client_secret})
+    except Exception as e:
+        from flask import jsonify
+        return jsonify({"error": str(e)}), 400
+
+
+# ── PAYMENT SUCCESS ───────────────────────────────────────────────────────────
+@app.route("/payment-success")
+def payment_success():
+    if "user_id" not in session:
+        return redirect("/login")
+    c.execute("UPDATE users SET is_pro=1 WHERE id=?", (session["user_id"],))
+    conn.commit()
+    body = """
+<div style="max-width:460px;margin:0 auto;padding:80px 24px;text-align:center;">
+    <div style="display:inline-flex;align-items:center;justify-content:center;
+        width:60px;height:60px;border-radius:50%;
+        background:rgba(50,215,75,0.12);border:1px solid rgba(50,215,75,0.25);
+        margin-bottom:20px;" class="a0">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none"
+            stroke="var(--green)" stroke-width="2.5" stroke-linecap="round">
+            <polyline points="20 6 9 17 4 12"/>
+        </svg>
+    </div>
+    <h1 style="font-size:26px;font-weight:700;letter-spacing:-.03em;
+        margin-bottom:8px;color:var(--green);" class="a1">
+        Welcome to Pro
+    </h1>
+    <p style="color:var(--t2);font-size:15px;margin-bottom:28px;" class="a2">
+        Your account has been upgraded. All Pro features are now active.
+    </p>
+    <a href="/dashboard" class="btn btnp a3">Go to Dashboard</a>
+</div>
+"""
+    return page("Payment Successful", body)
 
 
 # ── UPLOAD ────────────────────────────────────────────────────────────────────
@@ -751,41 +1190,14 @@ def upload():
     if "user_id" not in session:
         return redirect("/login")
 
-    # 🔒 REQUIRE PRO
-    c.execute("SELECT is_pro FROM users WHERE id=?", (session["user_id"],))
-    user = c.fetchone()
-    if not user or user[0] != 1:
-        return redirect("/upgrade")  # force payment
-
     file = request.files.get("file")
     if not file or not file.filename:
         return redirect("/dashboard")
 
-    file_id   = str(uuid.uuid4())
-    safe      = file.filename.replace("/", "_").replace("..", "_")
-    filename  = file_id + "_" + safe
-    path      = os.path.join(UPLOADS, filename)
-    file.save(path)
-
-    watermarked = apply_watermark(path)
-
-    c.execute("INSERT INTO files (id, user_id, filename, created) VALUES (?,?,?,?)",
-              (file_id, session["user_id"], filename,
-               datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-
-    base    = request.host_url.rstrip("/")
-    link    = f"{base}/view/{file_id}"
-    qr_img  = qrcode.make(link)
-    qr_path = os.path.join(QRS, file_id + ".png")
-    qr_img.save(qr_path)
-
-    return redirect(f"/qrview/{file_id}")  # 👈 NEW redirect
-
-    file_id   = str(uuid.uuid4())
-    safe      = file.filename.replace("/", "_").replace("..", "_")
-    filename  = file_id + "_" + safe
-    path      = os.path.join(UPLOADS, filename)
+    file_id  = str(uuid.uuid4())
+    safe     = file.filename.replace("/", "_").replace("..", "_")
+    filename = file_id + "_" + safe
+    path     = os.path.join(UPLOADS, filename)
     file.save(path)
 
     watermarked = apply_watermark(path)
@@ -826,70 +1238,30 @@ def upload():
             <polyline points="20 6 9 17 4 12"/>
         </svg>
     </div>
-
     <h1 style="font-size:26px;font-weight:700;letter-spacing:-.03em;
         margin-bottom:8px;" class="a1">QR Code Created</h1>
     <p style="color:var(--t2);font-size:15px;margin-bottom:28px;" class="a2">
-        Your QR code is live. Every scan is tracked in your dashboard.
+        Your QR code is live. Every scan earns you 1 point.
     </p>
-
     {wm_note}
-
     <div class="glass a2" style="border-radius:var(--rxl);padding:28px;
         display:inline-block;margin-bottom:20px;">
         <img src="/qr/{file_id}" width="200" height="200"
             style="border-radius:10px;display:block;background:#fff;">
     </div>
-
     <div class="glass a3" style="border-radius:var(--rmd);padding:14px 18px;
         margin-bottom:28px;text-align:left;">
         <div style="font-size:11px;color:var(--t3);text-transform:uppercase;
             letter-spacing:.06em;margin-bottom:6px;">Scan URL</div>
         <div style="font-size:13px;color:var(--ac);word-break:break-all;">{link}</div>
     </div>
-
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;" class="a4">
-        <a href="/dashboard" class="btn btnp">Back to Dashboard</a>
+        <a href="/dashboard" class="btn btnp">Dashboard</a>
         <a href="/manage"    class="btn btng">View All QRs</a>
     </div>
 </div>
 """
     return page("QR Created", body)
-
-@app.route("/qrview/<id>")
-def qrview(id):
-    if "user_id" not in session:
-        return redirect("/login")
-
-    c.execute("SELECT filename, user_id FROM files WHERE id=?", (id,))
-    row = c.fetchone()
-
-    if not row or row[1] != session["user_id"]:
-        return redirect("/manage")
-
-    base = request.host_url.rstrip("/")
-    link = f"{base}/view/{id}"
-
-    body = f"""
-    <div style="max-width:480px;margin:0 auto;padding:60px 24px;text-align:center;">
-        <h1 style="font-size:26px;font-weight:700;margin-bottom:20px;">Your QR Code</h1>
-
-        <div class="glass" style="padding:30px;border-radius:20px;margin-bottom:20px;">
-            <img src="/qr/{id}" width="220" style="background:#fff;border-radius:10px;">
-        </div>
-
-        <div class="glass" style="padding:14px;border-radius:12px;margin-bottom:20px;">
-            <div style="font-size:12px;color:gray;">Link</div>
-            <div style="font-size:13px;color:#2997ff;word-break:break-all;">{link}</div>
-        </div>
-
-        <div style="display:flex;gap:10px;justify-content:center;">
-            <a href="/dashboard" class="btn btnp">Dashboard</a>
-            <a href="/manage" class="btn btng">All QRs</a>
-        </div>
-    </div>
-    """
-    return page("View QR", body)
 
 
 # ── QR IMAGE ──────────────────────────────────────────────────────────────────
@@ -901,17 +1273,23 @@ def qr_img(id):
     return send_file(path)
 
 
-# ── VIEW (scan endpoint) ──────────────────────────────────────────────────────
+# ── VIEW (scan — awards point to owner) ──────────────────────────────────────
 @app.route("/view/<id>")
 def view(id):
-    c.execute("SELECT filename FROM files WHERE id=?", (id,))
+    c.execute("SELECT filename, user_id FROM files WHERE id=?", (id,))
     row = c.fetchone()
     if not row:
-        return ("<html><body style='font-family:sans-serif;padding:40px;background:#000;color:#fff;'>"
-                "<h2>QR code not found.</h2></body></html>"), 404
+        return ("<html><body style='font-family:sans-serif;padding:40px;"
+                "background:#000;color:#fff;'><h2>QR code not found.</h2>"
+                "</body></html>"), 404
+    filename, owner_id = row[0], row[1]
+
+    # Increment scan count and award 1 point to the QR owner
     c.execute("UPDATE files SET scans = scans + 1 WHERE id=?", (id,))
+    c.execute("UPDATE users SET points = COALESCE(points,0) + 1 WHERE id=?", (owner_id,))
     conn.commit()
-    return send_file(os.path.join(UPLOADS, row[0]))
+
+    return send_file(os.path.join(UPLOADS, filename))
 
 
 # ── MANAGE ────────────────────────────────────────────────────────────────────
@@ -938,9 +1316,7 @@ def manage():
                     <rect x="14" y="14" width="7" height="7" rx="1"/>
                 </svg>
             </div>
-            <p style="color:var(--t2);margin-bottom:20px;font-size:15px;">
-                No QR codes yet.
-            </p>
+            <p style="color:var(--t2);margin-bottom:20px;font-size:15px;">No QR codes yet.</p>
             <a href="/dashboard" class="btn btnp">Create your first QR code</a>
         </div>"""
     else:
@@ -956,20 +1332,18 @@ def manage():
                            flex-shrink:0;background:#fff;">
                 <div style="flex:1;min-width:0;">
                     <div style="font-size:14px;font-weight:500;margin-bottom:3px;
-                        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-                        {orig}
-                    </div>
+                        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{orig}</div>
                     <div style="font-size:12px;color:var(--t3);">Created {date}</div>
                 </div>
                 <div style="text-align:right;flex-shrink:0;margin-right:8px;">
-                    <div style="font-size:24px;font-weight:700;
+                    <div style="font-size:22px;font-weight:700;
                         letter-spacing:-.03em;color:var(--ac);">{r[2]}</div>
                     <div style="font-size:11px;color:var(--t3);
                         text-transform:uppercase;letter-spacing:.04em;">scans</div>
                 </div>
                 <div style="display:flex;gap:8px;flex-shrink:0;">
                     <a href="/qrview/{r[0]}" class="btn btng btnsm">View QR</a>
-                    <a href="/edit/{r[0]}" class="btn btng btnsm">Edit</a>
+                    <a href="/edit/{r[0]}"   class="btn btng btnsm">Edit</a>
                 </div>
             </div>"""
         cards_html += "</div>"
@@ -991,12 +1365,49 @@ def manage():
     return page("My QRs", body)
 
 
+# ── QR VIEW PAGE ──────────────────────────────────────────────────────────────
+@app.route("/qrview/<id>")
+def qrview(id):
+    if "user_id" not in session:
+        return redirect("/login")
+    c.execute("SELECT filename, user_id FROM files WHERE id=?", (id,))
+    row = c.fetchone()
+    if not row or row[1] != session["user_id"]:
+        return redirect("/manage")
+    base = request.host_url.rstrip("/")
+    link = f"{base}/view/{id}"
+    orig = row[0].split("_", 1)[1] if "_" in row[0] else row[0]
+    body = f"""
+<div style="max-width:480px;margin:0 auto;padding:60px 24px;text-align:center;">
+    <p style="font-size:12px;color:var(--t3);text-transform:uppercase;
+        letter-spacing:.06em;margin-bottom:8px;">Your QR Code</p>
+    <h1 style="font-size:22px;font-weight:700;letter-spacing:-.03em;margin-bottom:28px;" class="a0">
+        {orig}
+    </h1>
+    <div class="glass a1" style="border-radius:var(--rxl);padding:28px;
+        display:inline-block;margin-bottom:20px;">
+        <img src="/qr/{id}" width="220" style="background:#fff;border-radius:10px;display:block;">
+    </div>
+    <div class="glass a2" style="border-radius:var(--rmd);padding:14px 18px;
+        margin-bottom:24px;text-align:left;">
+        <div style="font-size:11px;color:var(--t3);text-transform:uppercase;
+            letter-spacing:.06em;margin-bottom:6px;">Scan URL</div>
+        <div style="font-size:13px;color:var(--ac);word-break:break-all;">{link}</div>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:center;" class="a3">
+        <a href="/manage"   class="btn btnp">All QRs</a>
+        <a href="/edit/{id}" class="btn btng">Replace File</a>
+    </div>
+</div>
+"""
+    return page("View QR", body)
+
+
 # ── EDIT ─────────────────────────────────────────────────────────────────────
 @app.route("/edit/<id>", methods=["GET", "POST"])
 def edit(id):
     if "user_id" not in session:
         return redirect("/login")
-
     c.execute("SELECT filename, user_id FROM files WHERE id=?", (id,))
     row = c.fetchone()
     if not row or row[1] != session["user_id"]:
@@ -1018,29 +1429,23 @@ def edit(id):
         </h1>
         <p style="color:var(--t2);font-size:14px;margin-bottom:24px;">
             The QR code URL stays the same. Only the content it delivers changes.
-            Images will be watermarked automatically.
+            Images are watermarked automatically.
         </p>
-
         <div style="border-radius:var(--rmd);padding:12px 14px;
-            background:rgba(255,255,255,0.03);border:1px solid var(--gb);
-            margin-bottom:20px;">
+            background:rgba(255,255,255,0.03);border:1px solid var(--gb);margin-bottom:20px;">
             <div style="font-size:11px;color:var(--t3);text-transform:uppercase;
                 letter-spacing:.05em;margin-bottom:4px;">QR ID</div>
             <div style="font-size:12px;font-family:monospace;color:var(--t2);">{id}</div>
         </div>
-
         <form method="post" enctype="multipart/form-data">
             <input type="file" name="file" id="ef" required
                 onchange="document.getElementById('el').textContent=this.files[0].name;">
-            <label for="ef" class="filedrop" id="el">
-                Click to choose replacement file
-            </label>
+            <label for="ef" class="filedrop" id="el">Click to choose replacement file</label>
             <button type="submit" class="btn btnp"
                 style="width:100%;margin-top:14px;padding:14px;border-radius:var(--rmd);">
                 Update Content
             </button>
         </form>
-
         <div style="text-align:center;margin-top:18px;">
             <a href="/manage" style="font-size:13px;color:var(--t3);">Cancel</a>
         </div>
