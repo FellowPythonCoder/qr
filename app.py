@@ -65,20 +65,56 @@ def apply_watermark(path, text="Snap2See"):
     try:
         img   = Image.open(path).convert("RGBA")
         w, h  = img.size
+
+        # Create overlay layer
         layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw  = ImageDraw.Draw(layer)
-        fsize = max(14, min(w, h) // 18)
+
+        # Scale font size to image dimensions
+        fsize = max(12, min(w, h) // 22)
         try:
             font = ImageFont.truetype(
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", fsize)
         except Exception:
             font = ImageFont.load_default()
+
+        # Measure text
         bbox   = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        pad    = 14
-        x, y   = w - tw - pad, h - th - pad
-        draw.rectangle([x - 8, y - 6, x + tw + 8, y + th + 6], fill=(0, 0, 0, 120))
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 220))
+
+        # Pill-shaped badge in bottom-right with generous padding
+        pad_x, pad_y = int(fsize * 0.9), int(fsize * 0.55)
+        margin = int(min(w, h) * 0.03)
+
+        rx1 = w - tw - pad_x * 2 - margin
+        ry1 = h - th - pad_y * 2 - margin
+        rx2 = w - margin
+        ry2 = h - margin
+
+        radius = (ry2 - ry1) // 2
+
+        # Draw pill background with semi-transparent dark fill
+        draw.rounded_rectangle(
+            [rx1, ry1, rx2, ry2],
+            radius=radius,
+            fill=(8, 8, 12, 185)
+        )
+
+        # Draw a subtle accent line at the top of the pill
+        draw.rounded_rectangle(
+            [rx1, ry1, rx2, ry1 + max(2, fsize // 10)],
+            radius=radius,
+            fill=(41, 151, 255, 160)
+        )
+
+        # Draw text centered in pill
+        tx = rx1 + pad_x
+        ty = ry1 + pad_y
+        # Subtle shadow
+        draw.text((tx + 1, ty + 1), text, font=font, fill=(0, 0, 0, 120))
+        # Main white text
+        draw.text((tx, ty), text, font=font, fill=(242, 242, 247, 230))
+
         out = Image.alpha_composite(img, layer).convert("RGB")
         out.save(path)
         return True
@@ -1265,9 +1301,31 @@ def view(id):
     c.execute("SELECT filename, user_id FROM files WHERE id=?", (id,))
     row = c.fetchone()
     if not row:
-        return ("<html><body style='font-family:sans-serif;padding:40px;"
-                "background:#000;color:#fff;'><h2>QR code not found.</h2>"
-                "</body></html>"), 404
+        # Modern 404 page
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Not Found — Snap2See</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#000;color:#f2f2f7;font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;
+  padding:40px 24px;}
+h2{font-size:22px;font-weight:600;margin-bottom:8px;}
+p{color:#98989f;font-size:15px;}
+</style>
+</head>
+<body>
+<div>
+  <div style="font-size:48px;margin-bottom:16px;">⚠</div>
+  <h2>QR code not found</h2>
+  <p>This link may have expired or been removed.</p>
+</div>
+</body>
+</html>""", 404
+
     filename, owner_id = row[0], row[1]
 
     # Increment scan count and award 1 point to the QR owner
@@ -1275,7 +1333,340 @@ def view(id):
     c.execute("UPDATE users SET points = COALESCE(points,0) + 1 WHERE id=?", (owner_id,))
     conn.commit()
 
+    # Detect file type to decide how to display
+    ext = os.path.splitext(filename)[1].lower()
+    orig_name = filename.split("_", 1)[1] if "_" in filename else filename
+
+    # For images, show a beautiful preview page instead of raw file
+    if ext in IMAGE_EXTS:
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>{orig_name} — Snap2See</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&display=swap');
+
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
+:root{{
+  --bg:#08080a;
+  --surface:rgba(255,255,255,0.04);
+  --border:rgba(255,255,255,0.08);
+  --t:#f0f0f5;--t2:#8e8e99;--t3:#48484f;
+  --ac:#2997ff;
+  --r:18px;
+}}
+
+html,body{{
+  background:var(--bg);
+  color:var(--t);
+  font-family:'DM Sans',-apple-system,BlinkMacSystemFont,sans-serif;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}}
+
+/* ── Animated background ── */
+.bg-mesh{{
+  position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none;
+}}
+.bg-mesh::before{{
+  content:'';position:absolute;
+  width:80vw;height:80vw;max-width:700px;max-height:700px;
+  top:-20%;left:50%;transform:translateX(-50%);
+  background:radial-gradient(ellipse,rgba(41,151,255,0.07) 0%,transparent 65%);
+  border-radius:50%;
+  animation:breathe 8s ease-in-out infinite;
+}}
+.bg-mesh::after{{
+  content:'';position:absolute;
+  width:60vw;height:60vw;max-width:500px;max-height:500px;
+  bottom:-10%;right:-10%;
+  background:radial-gradient(ellipse,rgba(120,40,200,0.06) 0%,transparent 65%);
+  border-radius:50%;
+  animation:breathe 10s 2s ease-in-out infinite reverse;
+}}
+@keyframes breathe{{
+  0%,100%{{transform:translateX(-50%) scale(1);opacity:1;}}
+  50%{{transform:translateX(-50%) scale(1.08);opacity:.7;}}
+}}
+
+/* ── Layout ── */
+.shell{{
+  position:relative;z-index:1;
+  min-height:100vh;
+  display:flex;flex-direction:column;
+  align-items:center;
+  padding:0 16px 60px;
+}}
+
+/* ── Top bar ── */
+.topbar{{
+  width:100%;max-width:800px;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:20px 0 28px;
+  animation:slideDown .5s cubic-bezier(.22,1,.36,1) both;
+}}
+@keyframes slideDown{{
+  from{{opacity:0;transform:translateY(-12px);}}
+  to{{opacity:1;transform:translateY(0);}}
+}}
+.brand{{
+  display:flex;align-items:center;gap:10px;
+  font-size:15px;font-weight:600;letter-spacing:-.02em;color:var(--t);
+  text-decoration:none;
+}}
+.brand-dot{{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--ac);
+  box-shadow:0 0 8px rgba(41,151,255,0.6);
+}}
+.scan-badge{{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:6px 12px;border-radius:99px;
+  background:rgba(41,151,255,0.1);
+  border:1px solid rgba(41,151,255,0.2);
+  font-size:12px;font-weight:500;color:var(--ac);
+  letter-spacing:.01em;
+}}
+.scan-badge-dot{{
+  width:6px;height:6px;border-radius:50%;background:var(--ac);
+  animation:pulse 2s ease-in-out infinite;
+}}
+@keyframes pulse{{
+  0%,100%{{opacity:1;transform:scale(1);}}
+  50%{{opacity:.4;transform:scale(.7);}}
+}}
+
+/* ── Image card ── */
+.img-card{{
+  width:100%;max-width:800px;
+  border-radius:24px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  overflow:hidden;
+  backdrop-filter:blur(20px);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.06) inset,
+    0 40px 120px rgba(0,0,0,0.5),
+    0 0 0 1px rgba(255,255,255,0.03);
+  animation:riseUp .6s .1s cubic-bezier(.22,1,.36,1) both;
+}}
+@keyframes riseUp{{
+  from{{opacity:0;transform:translateY(24px) scale(.98);}}
+  to{{opacity:1;transform:translateY(0) scale(1);}}
+}}
+
+.img-wrap{{
+  width:100%;
+  position:relative;
+  display:flex;align-items:center;justify-content:center;
+  background:#0c0c0e;
+  min-height:200px;
+  cursor:zoom-in;
+  overflow:hidden;
+}}
+.img-wrap img{{
+  width:100%;height:auto;
+  max-height:70vh;
+  object-fit:contain;
+  display:block;
+  transition:transform .3s ease;
+}}
+.img-wrap:hover img{{transform:scale(1.01);}}
+
+/* Shimmer loading state */
+.img-shimmer{{
+  position:absolute;inset:0;
+  background:linear-gradient(90deg,
+    rgba(255,255,255,0) 0%,
+    rgba(255,255,255,0.03) 50%,
+    rgba(255,255,255,0) 100%);
+  background-size:200% 100%;
+  animation:shimmer 1.8s ease-in-out infinite;
+}}
+@keyframes shimmer{{
+  0%{{background-position:-200% 0;}}
+  100%{{background-position:200% 0;}}
+}}
+
+.img-meta{{
+  padding:18px 22px 20px;
+  display:flex;align-items:center;justify-content:space-between;
+  gap:16px;
+  border-top:1px solid var(--border);
+  flex-wrap:wrap;
+}}
+.file-name{{
+  font-size:14px;font-weight:500;color:var(--t);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  max-width:300px;
+  flex:1;
+}}
+.dl-btn{{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:9px 18px;
+  border-radius:99px;
+  background:var(--ac);
+  color:#fff;
+  font-size:13px;font-weight:500;
+  text-decoration:none;
+  border:none;cursor:pointer;
+  font-family:inherit;
+  transition:all .18s ease;
+  flex-shrink:0;
+  box-shadow:0 4px 16px rgba(41,151,255,0.3);
+}}
+.dl-btn:hover{{
+  background:#1a86f0;
+  transform:translateY(-1px);
+  box-shadow:0 6px 20px rgba(41,151,255,0.4);
+}}
+.dl-btn:active{{transform:scale(.97);}}
+
+/* ── Powered by footer ── */
+.powered{{
+  margin-top:32px;
+  display:flex;align-items:center;gap:8px;
+  font-size:12px;color:var(--t3);
+  animation:fadeIn .6s .4s ease both;
+  opacity:0;animation-fill-mode:forwards;
+}}
+@keyframes fadeIn{{
+  from{{opacity:0;}}to{{opacity:1;}}
+}}
+.powered a{{
+  color:var(--t2);text-decoration:none;font-weight:500;
+  transition:color .15s;
+}}
+.powered a:hover{{color:var(--t);}}
+.powered-sep{{
+  width:3px;height:3px;border-radius:50%;background:var(--t3);
+}}
+
+/* ── Lightbox ── */
+.lightbox{{
+  display:none;position:fixed;inset:0;z-index:100;
+  background:rgba(0,0,0,0.92);
+  backdrop-filter:blur(12px);
+  align-items:center;justify-content:center;
+  padding:20px;
+  cursor:zoom-out;
+}}
+.lightbox.open{{display:flex;}}
+.lightbox img{{
+  max-width:100%;max-height:90vh;
+  object-fit:contain;
+  border-radius:12px;
+  box-shadow:0 40px 120px rgba(0,0,0,0.8);
+}}
+.lb-close{{
+  position:fixed;top:20px;right:20px;
+  width:36px;height:36px;border-radius:50%;
+  background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.15);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;color:#fff;font-size:18px;line-height:1;
+  transition:background .15s;
+}}
+.lb-close:hover{{background:rgba(255,255,255,0.18);}}
+
+@media(max-width:500px){{
+  .topbar{{padding:16px 0 20px;}}
+  .img-meta{{padding:14px 16px 16px;}}
+  .file-name{{font-size:13px;}}
+}}
+</style>
+</head>
+<body>
+
+<div class="bg-mesh"></div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lb" onclick="closeLb()">
+  <div class="lb-close" onclick="closeLb()">&#x2715;</div>
+  <img id="lb-img" src="" alt="">
+</div>
+
+<div class="shell">
+  <!-- Top bar -->
+  <div class="topbar">
+    <a href="/" class="brand">
+      <div class="brand-dot"></div>
+      Snap2See
+    </a>
+    <div class="scan-badge">
+      <div class="scan-badge-dot"></div>
+      Live content
+    </div>
+  </div>
+
+  <!-- Image card -->
+  <div class="img-card">
+    <div class="img-wrap" id="imgWrap" onclick="openLb()">
+      <div class="img-shimmer" id="shimmer"></div>
+      <img
+        src="/file/{id}"
+        alt="{orig_name}"
+        id="mainImg"
+        onload="document.getElementById('shimmer').style.display='none'"
+        onerror="this.parentElement.style.minHeight='140px'"
+      >
+    </div>
+    <div class="img-meta">
+      <div class="file-name">{orig_name}</div>
+      <a href="/file/{id}" download="{orig_name}" class="dl-btn">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+          <polyline points="17 8 12 13 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="13"/>
+        </svg>
+        Download
+      </a>
+    </div>
+  </div>
+
+  <!-- Powered by -->
+  <div class="powered">
+    <span>Delivered by</span>
+    <div class="powered-sep"></div>
+    <a href="/">Snap2See</a>
+    <div class="powered-sep"></div>
+    <span>Dynamic QR platform</span>
+  </div>
+</div>
+
+<script>
+function openLb(){{
+  document.getElementById('lb').classList.add('open');
+  document.getElementById('lb-img').src = document.getElementById('mainImg').src;
+  document.body.style.overflow = 'hidden';
+}}
+function closeLb(){{
+  document.getElementById('lb').classList.remove('open');
+  document.body.style.overflow = '';
+}}
+document.addEventListener('keydown', function(e){{
+  if(e.key === 'Escape') closeLb();
+}});
+</script>
+
+</body>
+</html>"""
+
+    # For non-images (PDFs, etc.), serve the file directly
     return send_file(os.path.join(UPLOADS, filename))
+
+
+# ── RAW FILE ENDPOINT (used by scan view page) ────────────────────────────────
+@app.route("/file/<id>")
+def raw_file(id):
+    c.execute("SELECT filename FROM files WHERE id=?", (id,))
+    row = c.fetchone()
+    if not row:
+        return "Not found", 404
+    return send_file(os.path.join(UPLOADS, row[0]))
 
 
 # ── MANAGE ────────────────────────────────────────────────────────────────────
