@@ -17,10 +17,8 @@ STRIPE_PRICE_ID        = os.environ.get("STRIPE_PRICE_ID",        "price_YOUR_PR
 
 # Points milestones: points_needed -> prize label
 MILESTONES = {
-    50:  "Free Month of Pro",
-    150: "Snap2See Branded Hoodie",
-    300: "Amazon Gift Card — $25",
-    500: "iPhone Giveaway Entry",
+    100:  "One Month of Pro — Free",
+    1000: "One Year of Pro — Free",
 }
 
 os.makedirs(UPLOADS, exist_ok=True)
@@ -450,7 +448,7 @@ footer a:hover{color:var(--t2);}
     <h1 class="heroTitle">Snap2See</h1>
     <p class="heroSub">
         Print once. Update forever. Every scan earns you points
-        toward real prizes — free months, gear, and more.
+        toward free Pro — one month at 100, one year at 1,000.
     </p>
     <div class="heroCta">
         <a href="/login" class="btn btnp">Create an Account</a>
@@ -466,8 +464,8 @@ footer a:hover{color:var(--t2);}
         <div class="stripLabel">earned per scan on your QRs</div>
     </div>
     <div class="stripItem">
-        <div class="stripNum">50 pts</div>
-        <div class="stripLabel">unlocks your first prize</div>
+        <div class="stripNum">100 pts</div>
+        <div class="stripLabel">unlocks one free month of Pro</div>
     </div>
     <div class="stripItem">
         <div class="stripNum">Dynamic</div>
@@ -522,27 +520,15 @@ footer a:hover{color:var(--t2);}
     </p>
     <div class="rewardGrid">
         <div class="rewardCard">
-            <div class="rewardPts">50</div>
+            <div class="rewardPts">100</div>
             <div class="rewardPtsLabel">points</div>
-            <div class="rewardName">Free Month of Pro</div>
+            <div class="rewardName">One Month of Pro — Free</div>
             <div class="rewardBar"></div>
         </div>
         <div class="rewardCard">
-            <div class="rewardPts">150</div>
+            <div class="rewardPts">1,000</div>
             <div class="rewardPtsLabel">points</div>
-            <div class="rewardName">Snap2See Branded Hoodie</div>
-            <div class="rewardBar"></div>
-        </div>
-        <div class="rewardCard">
-            <div class="rewardPts">300</div>
-            <div class="rewardPtsLabel">points</div>
-            <div class="rewardName">Amazon Gift Card — $25</div>
-            <div class="rewardBar"></div>
-        </div>
-        <div class="rewardCard">
-            <div class="rewardPts">500</div>
-            <div class="rewardPtsLabel">points</div>
-            <div class="rewardName">iPhone Giveaway Entry</div>
+            <div class="rewardName">One Year of Pro — Free</div>
             <div class="rewardBar"></div>
         </div>
     </div>
